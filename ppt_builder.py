@@ -56,7 +56,8 @@ def ensure_ollama_running(base_url: str = "http://localhost:11434"):
 
 def extract_json_block(text: str) -> str:
     """Extract the first JSON object from text (in case the model adds prose)."""
-    start = text.find("{"); end = text.rfind("}")
+    start = text.find("{"); 
+    end = text.rfind("}")
     if start != -1 and end != -1 and end > start:
         return text[start:end + 1]
     return text
@@ -141,6 +142,15 @@ def read_pdf_text(pdf_path: str) -> Tuple[str, List[str]]:
             pages.append("")
     full_text = "\n".join(pages)
     return full_text, pages
+
+def get_local_ollama_models(base_url: str = "http://localhost:11434") -> List[str]:
+    """Get the list of locally available Ollama models."""
+    try:
+        r = requests.get(f"{base_url}/api/tags")
+        r.raise_for_status()
+        return [m["name"] for m in r.json().get("models", [])]
+    except Exception:
+        return []
 
 def generate_outfile_name_with_ollama(topic: str, model: str = "llama3.1:8b") -> str:
     """Ask Ollama to propose a short filename for the PPT deck."""
@@ -420,17 +430,31 @@ def build_pptx(deck: Deck, outfile: str = "deck.pptx", template: Optional[str] =
 def main():
     import argparse
 
+    local_models = get_local_ollama_models()
+    if not local_models:
+        print("❌ Could not find any local Ollama models. Please run `ollama pull <model_name>`.")
+        sys.exit(1)
+
     parser = argparse.ArgumentParser(description="Build a PowerPoint using LangChain + Ollama. Can read a research PDF.")
     parser.add_argument("--topic", required=True, help="Topic of the presentation (used in slides & footer)")
     parser.add_argument("--audience", default="general")
     parser.add_argument("--tone", default="informative")
     parser.add_argument("--slides", type=int, default=8, help="Number of content slides (welcome/thanks added automatically)")
-    parser.add_argument("--model", default="llama3.1:8b", help="e.g., llama3.1:8b, mistral, qwen2")
+    parser.add_argument("--model", default=None, help=f"Model to use. If not specified, defaults to the first available model. Options: {', '.join(local_models)}") # No default here, we'll set it intelligently
     parser.add_argument("--outfile", default="deck.pptx")
     parser.add_argument("--template", default=None, help="Optional .potx/.pptx theme")
     parser.add_argument("--pdf", default=None, help="Path to a research paper PDF; if omitted, auto-detects first *.pdf in CWD")
     parser.add_argument("--no-references", action="store_true", help="Disable references slide")
     args = parser.parse_args()
+
+    if args.model:
+        if args.model not in local_models:
+            print(f"❌ Model '{args.model}' not found locally. Available models: {', '.join(local_models)}")
+            sys.exit(1)
+        selected_model = args.model
+    else:
+        selected_model = local_models[0]
+        print(f"ℹ️ No model specified. Defaulting to '{selected_model}'.")
 
     paper_bullets = None
     reference_lines = None
@@ -449,7 +473,7 @@ def main():
             )
             chunks = splitter.split_text(full_text)
             # Map: extract notes per chunk
-            llm_notes = ChatOllama(model=args.model, temperature=0.1, format="json")
+            llm_notes = ChatOllama(model=selected_model, temperature=0.1, format="json")
             all_bullets: List[str] = []
             for ch in chunks[:24]:  # cap for speed
                 notes = summarize_chunk_notes(llm_notes, ch, max_bullets=7)
@@ -467,7 +491,7 @@ def main():
             audience=args.audience,
             tone=args.tone,
             slide_count=args.slides,
-            model=args.model,
+            model=selected_model,
             paper_summary_bullets=paper_bullets,
             add_references=not args.no_references,
             reference_lines=reference_lines,
@@ -482,7 +506,7 @@ def main():
 
     try:
         if not args.outfile or args.outfile.strip() == "deck.pptx":
-            args.outfile = generate_outfile_name_with_ollama(args.topic, model=args.model)
+            args.outfile = generate_outfile_name_with_ollama(args.topic, model=selected_model)
             print(f"🪶 Ollama named your file: {args.outfile}")
 
         path = build_pptx(deck, args.outfile, template=args.template)
