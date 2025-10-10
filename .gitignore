@@ -1,0 +1,57 @@
+Python artifacts
+pycache/
+*.pyc
+*.pyo
+*.pyd
+*build/
+*develop-eggs/
+*dist/
+*downloads/
+*eggs/
+*.egg-info/
+*lib/
+*lib64/
+*parts/
+*sdist/
+*var/
+*wheels/
+*share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+Virtual Environment
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak
+venv.bak
+
+Conda environment
+Replace 'ppt_builder' with the name of your Conda environment if different
+/ppt_builder/
+
+IDE and editor configuration files
+.vscode/
+.idea/
+*.suo
+.ntvs
+*.njsproj
+*.sln
+*.sw?
+
+Generated output files
+This will ignore all PowerPoint files created by the agent
+*.pptx
+
+Local data files
+Ignore any PDFs you place in the 'papers' directory for testing
+papers/*.pdf
+
+OS-generated files
+.DS_Store
+Thumbs.db
+._*
