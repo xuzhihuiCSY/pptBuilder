@@ -7,6 +7,8 @@ import datetime
 import requests
 from pydantic import BaseModel, Field, ValidationError
 from pypdf import PdfReader
+from concurrent.futures import ThreadPoolExecutor
+import argparse
 
 from pptx import Presentation
 from pptx.util import Inches, Pt
@@ -428,8 +430,6 @@ def build_pptx(deck: Deck, outfile: str = "deck.pptx", template: Optional[str] =
 # CLI
 # =========================
 def main():
-    import argparse
-
     local_models = get_local_ollama_models()
     if not local_models:
         print("❌ Could not find any local Ollama models. Please run `ollama pull <model_name>`.")
@@ -475,9 +475,11 @@ def main():
             # Map: extract notes per chunk
             llm_notes = ChatOllama(model=selected_model, temperature=0.1, format="json")
             all_bullets: List[str] = []
-            for ch in chunks[:24]:  # cap for speed
-                notes = summarize_chunk_notes(llm_notes, ch, max_bullets=7)
-                all_bullets.extend(notes)
+
+            with ThreadPoolExecutor() as executor:
+                results = executor.map(lambda ch: summarize_chunk_notes(llm_notes, ch, max_bullets=7), chunks[:24])
+                for note_list in results:
+                    all_bullets.extend(note_list)
             # Reduce: compress
             paper_bullets = reduce_notes(llm_notes, all_bullets, max_out=40)
             # References
