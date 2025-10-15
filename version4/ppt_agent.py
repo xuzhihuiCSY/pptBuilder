@@ -3,7 +3,9 @@ import os, json, re
 from typing import TypedDict, Optional, List, Dict, Any, Literal
 
 # --- LangChain / LangGraph ---
-from langchain_ollama import ChatOllama
+from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline, AutoConfig
+import torch
+from langchain_huggingface import ChatHuggingFace, HuggingFacePipeline
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from langchain_core.runnables import RunnableLambda
 from langgraph.graph import StateGraph, END
@@ -15,9 +17,14 @@ import fitz  # PyMuPDF
 from pptx import Presentation
 import pathlib
 import math
+from functools import lru_cache
 
 GENERIC_TITLE_PAT = re.compile(r"^(topic|section|slide)\s*\d+\b", re.I)
 
+try:
+    from transformers import BitsAndBytesConfig
+except Exception:
+    BitsAndBytesConfig = None
 # =============================================================
 # 1) Tool Implementations (pure Python + small LLM helpers)
 # =============================================================
@@ -28,29 +35,68 @@ class ReadPDFIn(BaseModel):
     mode: Optional[str] = Field(default="fast", description='Reading mode: "fast" or "full".')
     verbose: Optional[bool] = Field(default=True, description="Print progress while reading")
 
+@lru_cache(maxsize=1)
+def get_llm_singleton(temp: float = 0.2, num_predict: int = 320):
+    return get_llm_20b(temp=temp, num_predict=num_predict)
 
 def get_llm_20b(temp: float = 0.2, num_predict: int = 320):
-    model = os.getenv("OLLAMA_MODEL", "gpt-oss:20b")  # or your 20B tag
-    base  = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
-    return ChatOllama(
+    import os, warnings
+    model_id = os.getenv("HF_MODEL_ID", "Qwen/Qwen2.5-7B-Instruct")
+    want_4bit = os.getenv("HF_LOAD_4BIT", "0") == "1"
+
+    tok = AutoTokenizer.from_pretrained(model_id, use_fast=True)
+    cfg = AutoConfig.from_pretrained(model_id)
+
+    qcfg = getattr(cfg, "quantization_config", None)
+    is_mxfp4 = False
+    if qcfg:
+        qt = getattr(qcfg, "quant_method", None) or getattr(qcfg, "quantization_method", None) or getattr(qcfg, "quant_type", None)
+        is_mxfp4 = str(qt).lower().startswith("mxfp4")
+
+    load_kwargs = dict(device_map="auto")
+    if is_mxfp4:
+        load_kwargs.update(dtype=torch.bfloat16)
+        model = AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs)
+    else:
+        if want_4bit and BitsAndBytesConfig is not None:
+            quant_cfg = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
+            )
+            model = AutoModelForCausalLM.from_pretrained(
+                model_id,
+                quantization_config=quant_cfg,
+                device_map="auto",
+            )
+        else:
+            dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+            model = AutoModelForCausalLM.from_pretrained(model_id, dtype=dtype, device_map="auto")
+
+    gen_pipe = pipeline(
+        task="text-generation",
         model=model,
-        base_url=base,
+        tokenizer=tok,
+        max_new_tokens=int(os.getenv("HF_MAX_NEW_TOKENS", str(num_predict))),
+        do_sample=(temp > 0),
         temperature=temp,
-        num_predict=num_predict,
+        top_p=0.9,
+        repetition_penalty=1.05,
+        pad_token_id=tok.eos_token_id,
+        eos_token_id=tok.eos_token_id,
     )
+
+    hf_llm = HuggingFacePipeline(pipeline=gen_pipe)
+    return ChatHuggingFace(llm=hf_llm)
+
 
 def read_pdf(path: str,
              pages: Optional[str] = None,
              mode: str = "full",
-             max_chars: Optional[int] = None,   # None => no char cap
-             max_pages: Optional[int] = None,   # None => no page cap
+             max_chars: Optional[int] = None,
+             max_pages: Optional[int] = None,
              verbose: bool = True) -> str:
-    """
-    Unlimited reader by default:
-      - If `pages` is None: read ALL pages.
-      - `max_chars=None` and `max_pages=None` => no early stop.
-      - Prints progress like [read_pdf] pages: i/N … total_chars=K
-    """
     import os, fitz, re
     if verbose:
         print(f"[read_pdf] path: {path}")
@@ -161,7 +207,7 @@ def summarize_text(text: str,
         note = f" ({', '.join(cap_note)})" if cap_note else ""
         print(f"[summ] map: {len(chunks)} chunk(s){note}")
 
-    llm_map = get_llm_20b(temp=0.2, num_predict=260)
+    llm_map = get_llm_singleton(temp=0.2, num_predict=320)
     partials = []
     map_prompt_tpl = (
         "Summarize the following technical text in ~120 words. "
@@ -180,7 +226,7 @@ def summarize_text(text: str,
         print(f"[summ] reduce: combining {len(partials)} partial(s) …")
 
     def _reduce(num_predict: int, tgt_words: int, stronger: bool = False) -> str:
-        llm_red = get_llm_20b(temp=0.2, num_predict=num_predict)
+        llm_red = get_llm_singleton(temp=0.2, num_predict=num_predict)
         tgt = max(250, min(900, tgt_words))
         if stronger:
             reduce_prompt = (
@@ -214,7 +260,7 @@ def summarize_text(text: str,
             print("[summ] reduce empty — using fallback join+squeeze …")
         joined = " ".join(partials[: min(10, len(partials))])
         # One last pass to compress joined partials into a single paragraph
-        llm_fallback = get_llm_20b(temp=0.2, num_predict=1200)
+        llm_fallback = get_llm_singleton(temp=0.2, num_predict=1200)
         fb_prompt = (
             "Condense the following text into a clear 300–450 word executive summary. "
             "No bullets or headings; write fluent paragraphs; avoid repetition:\n\n" + joined
@@ -251,8 +297,7 @@ class OutlineIn(BaseModel):
     verbose: bool = Field(default=True, description="If true, print per-step outline progress to console.")
 
 def densify_slide_with_llm(title: str, topic: str, notes: str, max_points: int = 5) -> tuple[str, list[str]]:
-    model = os.environ.get("OLLAMA_MODEL", "gpt-oss:20b")
-    llm = ChatOllama(model=model, temperature=0.3)
+    llm = get_llm_singleton(temp=0.3, num_predict=400)
     prompt = (
         "Improve ONE presentation slide.\n"
         "Return STRICT JSON ONLY:\n"
@@ -284,18 +329,13 @@ def slide_outline_json(notes: Optional[str] = None,
                        slide_target: int = 11,
                        topic: Optional[str] = None,
                        verbose: bool = True) -> Dict[str, Any]:
-    """
-    Generate a deck outline JSON. If notes are present, outline from notes (preferred).
-    Otherwise, generate directly from topic. Prints progress logs when verbose=True.
-    """
     import json, os, re, datetime
 
     def log(msg: str):
         if verbose:
             print(msg)
 
-    model = os.environ.get("OLLAMA_MODEL", "gpt-oss:20b")
-    llm = ChatOllama(model=model, temperature=0.2)
+    llm = get_llm_singleton(temp=0.2, num_predict=900)
 
     def _clean(s: str) -> str:
         return re.sub(r"^[\s\*\-•·]+", "", str(s or "")).strip()
@@ -921,9 +961,7 @@ def extract_quant_facts(text: str, max_items: int = 20) -> list[str]:
 
 # --- Planner Node: LLM decides next action (which tool/chat/finish) ---
 def planner_node(state: AgentState) -> AgentState:
-    model = os.environ.get("OLLAMA_MODEL", "gpt-oss:20b")
-    llm = ChatOllama(model=model, temperature=0)
-
+    llm = get_llm_singleton(temp=0.0, num_predict=256)
     user_text = last_user_text(state).strip()
     text_l = user_text.lower()
     state["next_action"] = None
@@ -945,6 +983,7 @@ def planner_node(state: AgentState) -> AgentState:
     asks_build_now = "build slides now" in text_l or text_l == "build slides" or "build now" in text_l
 
     slide_target = extract_slide_count(text_l, default=11)
+    state["last_slide_target"] = slide_target
     pdf_path = extract_pdf_path(user_text) if mentions_pdf else None
 
     # --- SUMMARY-ONLY path: read → summarize → finish (no loops)
@@ -1047,11 +1086,7 @@ def tool_node(state: AgentState) -> AgentState:
             result = tool.invoke(args)
         except Exception as e:
             msg = str(e)
-            base = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
-            if "10061" in msg or "ConnectError" in msg or "actively refused" in msg:
-                state = add_message(state, "assistant", f"❌ Can't reach your Ollama server at {base}. Start it with `ollama serve` and try again.")
-            else:
-                state = add_message(state, "assistant", f"❌ Tool `{action}` failed: {e}")
+            state = add_message(state, "assistant", f"❌ Tool `{action}` failed: {e}")
             state["next_action"] = "finish"; state["next_args"] = {}; return state
     else:
         result = None
@@ -1066,10 +1101,11 @@ def tool_node(state: AgentState) -> AgentState:
         summary = (result or "").strip()
         state["notes"] = summary
 
-        if state.get("auto"):  # user said "build slides" → continue to outline & build
+        if state.get("auto"): 
             state["auto"] = False
             try:
-                outline = TOOLS["slide_outline_json"].invoke({"notes": summary, "slide_target": 11})
+                target = int(state.get("last_slide_target", 11))
+                outline = TOOLS["slide_outline_json"].invoke({"notes": summary, "slide_target": target})
             except Exception as e:
                 state = add_message(state, "assistant", f"Summary ready ✔\n\n{summary}\n\n(Outline failed during auto-chain: {e})")
                 state["next_action"] = "finish"; state["next_args"] = {}; return state
@@ -1136,9 +1172,7 @@ def tool_node(state: AgentState) -> AgentState:
 
 # --- Chat Node: simple chat response (no tools) ---
 def chat_node(state: AgentState) -> AgentState:
-    """Plain conversational reply (no tools). Ends the turn via chat→END edge."""
-    model = os.environ.get("OLLAMA_MODEL", "gpt-oss:20b")
-    llm = ChatOllama(model=model, temperature=0)
+    llm = get_llm_singleton(temp=0.0, num_predict=320)
 
     # Short system guidance to keep answers crisp
     sys = SystemMessage(content=(
@@ -1203,8 +1237,9 @@ def build_app():
 # =============================================================
 
 if __name__ == "__main__":
-    model = os.environ.get("OLLAMA_MODEL", "gpt-oss:20b")
-    print(f"🧠 Using Ollama model: {model}")
+    hf_id = os.environ.get("HF_MODEL_ID", "Qwen/Qwen2.5-7B-Instruct")
+    print(f"🧠 Using HF model: {hf_id}")
+
     app = build_app()
 
     state: AgentState = {"messages": []}

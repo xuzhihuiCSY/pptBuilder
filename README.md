@@ -1,37 +1,42 @@
-# PPT Builder / LangGraph PPT Agent — Multi‑Version Guide
+# PPT Builder & Agents — Monorepo README (v1 · v2 · v3 · v4)
 
-This repository contains **three related command‑line tools** for turning PDFs or topics into PowerPoint decks. Each version lives in its own folder and targets a different scope and maturity level.
+This repository contains four related tools for turning topics and PDFs into PowerPoint decks. They evolve from a classic, non-agent pipeline (**v1**) to increasingly agentic systems (**v2**, **v3**) and a CPU-first agent with a future UI plan (**v4**).
 
 ```
 .
-├─ version1/   # Classic PPT Builder (non‑agent)
-├─ version2/   # Agent v2 (lightweight tool-calling)
-└─ version3/   # Agent v3 (LangGraph state machine)
+├─ version1/   # Classic builder (non-agent) — stable
+├─ version2/   # Lightweight AI agent (tool-calling)
+├─ version3/   # LangGraph AI agent (planner + repairs)
+└─ version4/   # CPU-first LangGraph AI agent (UI planned)
 ```
 
-> TL;DR: **v1** is stable and will not change. **v2** and **v3** are the active lines for improvements—especially PDF reading accuracy & speed and PPT beautification. **v3** will also grow new features like “summary‑only” and other power‑user flows.
-
 ---
 
-## 🧭 Which version should I use?
+## 🧭 Which version should I pick?
 
-| Need | Use this |
+| Scenario | Recommended version |
 |---|---|
-| Simple “topic → deck” or “PDF → deck” with minimal moving parts | **version1** |
-| Agentic workflow with tool calls, local LLMs, and a conversational CLI | **version2** |
-| A **LangGraph** state machine that plans actions (read → summarize → outline → build), fixes bad slides, and writes strong JSON outlines | **version3** |
+| I want a simple, predictable CLI that converts a topic or PDF to slides with minimal moving parts. | **v1 (non-agent, stable)** |
+| I want a prompt-driven CLI that uses a local LLM to call tools and build decks. | **v2 (lightweight agent)** |
+| I want a more robust agent with planning, JSON-outline validation, and self-repair for slides. | **v3 (LangGraph agent)** |
+| I need CPU-only model running today, and I’d like a future UI (desktop/web) on top. | **v4 (CPU-first LangGraph agent)** |
+
+**Agent or not?**
+- **v1**: not an agent (fixed pipeline; may call LLM once for summary).
+- **v2**: yes—lightweight agent (prompt → tool calls → PPT).
+- **v3**: yes—LangGraph agent (planner + validation + repairs).
+- **v4**: yes—LangGraph agent focused on CPU-only models; UI coming next.
 
 ---
 
-## 📦 Common Requirements (all versions)
+## ✅ Common Requirements
 
-- **Python 3.9+**
-- **Ollama** running locally (`http://localhost:11434`) with at least one pulled model (e.g., `llama3.1:8b`):
-  ```bash
-  ollama serve
-  ollama pull llama3.1:8b
-  ```
-- **python-pptx** for rendering decks
+- **Python** 3.9+ (3.10+ recommended for v4)
+- **PowerPoint rendering:** `python-pptx`
+- **PDF reading:** `pymupdf` (PyMuPDF) recommended for v2–v4, `pypdf` is fine for v1
+- **Local LLMs:**
+  - **v1–v3:** typically Ollama-backed chat models (e.g., `llama3.1:8b`)
+  - **v4:** Hugging Face Transformers on CPU (`torch`, `transformers`, etc.)
 
 Create a virtual environment (recommended):
 ```bash
@@ -44,120 +49,109 @@ source .venv/bin/activate
 
 ---
 
-## 📁 version1 — PPT Builder (non‑agent, stable)
+## 📁 Version Overviews
 
-A straightforward pipeline that reads a PDF (or a topic), summarizes, and renders a professional PowerPoint deck. It’s **not** an agent and is **frozen** (no planned changes).
+### version1 — Classic Builder (non-agent · stable)
+- **What it does:** Deterministic pipeline → read PDF/topic → summarize → build PPT.
+- **Why use it:** Minimal dependencies, predictable outputs, no planning layer.
+- **Status:** Feature-frozen; good baseline and for constrained environments.
 
-**Highlights (from v1 README):**
-- Reads academic PDFs (no OCR needed), summarizes with your local Ollama model, and builds slides via `python-pptx`.
-- CLI flags for topic, audience, tone, slide count, model, template, and output filename.
-- Optionally adds a References slide.  
-Source: fileciteturn2file2
-
-**Install deps (example):**
+**Install (example):**
 ```bash
 pip install langchain-core langchain-text-splitters langchain-ollama pydantic pypdf python-pptx requests
 ```
 
-**Run examples:**
+**Run:**
 ```bash
 # Topic only
 python ppt_builder.py --topic "AI Bias in Language Models"
 
-# From a specific paper
+# From a specific PDF
 python ppt_builder.py --topic "Inversion Models" --pdf path/to/paper.pdf
 ```
 
-> ✅ **Status:** Stable; **no further changes planned** (kept for compatibility and simplicity).
-
 ---
 
-## 🤖 version2 — Agent v2 (lightweight tool‑calling)
+### version2 — Lightweight AI Agent (tool-calling)
+- **What it does:** Prompt → agent picks tools → summarize PDF or topic → build PPT.
+- **How you use it:** Conversational commands like `make 11 slides ppt about dog`, `summary only for D:/paper.pdf`, `build slides now`.
+- **Focus for improvements:** PDF reading **accuracy & speed**, **PPT beautify**.
 
-An interactive CLI agent that auto‑detects a local Ollama model, summarizes PDFs (or general knowledge), and builds a `.pptx` from a single prompt.  
-Source: fileciteturn2file1
-
-**Quick start:**
+**Install & run:**
 ```bash
 cd version2
 pip install -r requirements.txt
 python main.py
 ```
-Try prompts like:
-- `make 11 slides ppt about dog`
-- `summary only for D:/papers/attention.pdf`
-- `read D:/papers/paper.pdf pages 1-3 and summarize`
-- `build slides now`
 
-### 🔧 Planned Improvements for v2
-Focus areas you flagged:
-1) **PDF reading accuracy & speed**
-   - Switch/option to **PyMuPDF (`fitz`)** for faster, more robust text extraction (fall back to `pypdf` when needed).
-   - Page‑range support and **lazy/streamed parsing** to avoid loading entire files in memory.
-   - **Chunking & caching**: intelligent chunk sizes; cache parsed text keyed by file hash & page ranges.
-   - Optional **parallel parsing** (multiprocessing) on multi‑core machines.
-2) **PPT beautify**
-   - Theme presets (corporate/academic/minimal), slide master templates, brand colors & fonts.
-   - Better layout balancing (title vs bullets), auto‑fit, consistent spacing, and optional iconography.
-   - Optional “References / Further reading” slide.
-3) **Quality of life**
-   - Clearer progress messages, error handling for scanned PDFs (suggest OCR), and model selection flag.
-
-> 🎯 Goal: Keep v2 “lightweight” but noticeably **faster** on PDFs and **nicer** output decks.
+**Planned enhancements (v2):**
+- PyMuPDF reader path + page ranges; fallback to `pypdf`.
+- Parsing cache by file hash + page ranges; optional parallel parsing.
+- Theme presets, improved spacing/auto-fit, references slide.
+- Better progress messages and model-selection flags.
 
 ---
 
-## 🕸️ version3 — Agent v3 (LangGraph state machine)
+### version3 — LangGraph AI Agent (planner + validation + repairs)
+- **What it does:** LangGraph chooses steps (read → summarize → outline → build); validates JSON outline; fixes thin/generic slides; enforces **Welcome → Content → Conclusion → Thanks** and exact slide counts.
+- **Why it’s “more agentic”:** It plans, validates, and repairs with tool calls and caches artifacts.
 
-A single‑file agent (`ppt_agent.py`) using **LangGraph** to plan actions: it reads PDFs (with page ranges), generates dense notes, creates a strict JSON outline (title, subtitle, 3–5 bullets per slide), repairs thin/generic slides, and renders a `.pptx`.  
-Source: fileciteturn2file0
-
-**Quick start:**
+**Install & run:**
 ```bash
 cd version3
 pip install langchain-ollama langgraph langchain-core pydantic pymupdf python-pptx
 python ppt_agent.py
 ```
-Prompts you can try:
-- `make 11 slides ppt about dog`
+
+**Useful commands:**
 - `summary only for "D:/papers/attention.pdf"`
 - `read D:/papers/paper.pdf pages 1-3 and summarize`
+- `make 11 slides ppt about diffusion models`
 - `build slides now`
 - `regenerate outline`
 
-### ✨ What v3 already does well
-- **PyMuPDF** page‑range extraction, **dense notes** generation, **JSON outline with validation**, and **auto‑fixes** for thin or repetitive slides.
-- Enforces **Welcome → Content → Conclusion → Thanks** and exact slide counts.
-- Smart `python-pptx` rendering with collision‑free filenames.
-
-### 🚧 Planned Improvements for v3
-Your requested areas plus advanced feature work:
-1) **PDF reading accuracy & speed**
-   - Keep PyMuPDF as default; add **adaptive page sampling** for quick “first pass” summaries.
-   - **Async / streaming** read path for huge PDFs; optional **background pre‑read** of next pages.
-   - Cache: `file_hash + page_ranges` → parsed text; reuse across runs.
-2) **PPT beautify**
-   - Theming API (preset styles), auto‑layout choice per slide (title‑only, title+bullets, two‑column), and image placeholders.
-   - Bullet de‑dup & line‑wrap tuning; consistent font sizes across the deck.
-3) **Feature growth**
-   - **Summary‑only mode** (produce notes to disk without building slides) exposed as a first‑class command.
-   - **Per‑section summaries** (e.g., “summary separately” for selective slides or chapters).
-   - **Multi‑document synthesis** (merge notes across many PDFs).
-   - **Citations & references** slide from extracted metadata/DOIs.
-   - **Retry / self‑repair** when the LLM returns non‑JSON for a slide patch.
-   - Optional **image/diagram generation** hooks and media placement.
-4) **Developer ergonomics**
-   - Config file (`settings.toml`) for defaults (model, theme, slide count).
-   - Export intermediate artifacts (`notes.txt`, `outline.json`) to a `./artifacts/` folder.
-   - Verbose mode with timing breakdowns for each stage.
-
-> 🎯 Goal: Make v3 the **feature‑rich** line with strong planning (LangGraph), high‑quality decks, and flexible output modes.
+**Planned enhancements (v3):**
+- Faster/async PDF reading; adaptive page sampling; better caching.
+- Theming API, two-column/title-only layouts, image placeholders.
+- “Summary-only” & “summary separately” (per section/page range).
+- Multi-document synthesis; citations/reference slide.
+- Export artifacts (`notes.txt`, `outline.json`) with timing breakdowns.
 
 ---
 
-## 🧪 Repository Layout & Scripts
+### version4 — CPU-First LangGraph AI Agent (UI planned)
+- **What it is now:** LangGraph agent using **Hugging Face Transformers** on **CPU only**; optimizing for speed/memory on CPU.
+- **What’s next:** A simple **UI** (desktop/web) for file-picking, page-range helpers, theme selection, progress, and “summary-only” export.
 
-Suggested folder structure (already used or recommended):
+**Install & run:**
+```bash
+cd version4
+pip install transformers torch langchain-huggingface langgraph langchain-core pydantic pymupdf python-pptx
+python ppt_agent.py
+```
+
+**CPU tips:**
+- Start with ≤7B instruction-tuned models (e.g., `Qwen2.5-7B-Instruct`).
+- Keep `HF_LOAD_4BIT=0` on CPU-only boxes; bitsandbytes 4-bit is mostly for CUDA.
+- Control generation length via `HF_MAX_NEW_TOKENS`.
+
+**Roadmap (v4):**
+- CPU: tune chunk sizes; reduce memory spikes; timing breakdowns.
+- UI: PySide/Qt or small web UI; templates/themes; live progress.
+- Beautify: `.potx` themes; balanced layouts; references slide.
+- Features: multi-doc synthesis; citations; image/diagram hooks; `settings.toml` config.
+
+---
+
+## 🧰 Templates & Theming (v2–v4)
+- Provide a `/themes` folder with `.potx/.pptx` templates (corporate, academic, minimalist).
+- Add a `--theme` or `THEME=<name>` flag for quick selection.
+- Keep a clean default theme for out-of-the-box usage.
+
+---
+
+## 🧪 Repository Structure (suggested)
+
 ```
 version1/
   ppt_builder.py
@@ -168,54 +162,18 @@ version2/
 version3/
   ppt_agent.py
   README.md
-```
-
-Optionally add a top‑level script to run a specific version quickly:
-```bash
-# Windows Powershell
-python .\version3\ppt_agent.py
-# macOS/Linux
-python ./version3/ppt_agent.py
+version4/
+  ppt_agent.py
+  README.md
+themes/           # optional templates
 ```
 
 ---
 
-## 🧰 Templates & Theming (for v2/v3)
-- Add a `/themes` folder with `.potx/.pptx` templates (corporate, academic, minimal).
-- Expose `--theme` or `THEME=<name>` to select a template at runtime.
-- Provide a default minimalist theme out of the box.
+## 🛠 Troubleshooting (common)
 
----
+- **Slow summaries** → Use smaller models (7B), clamp PDF page ranges, reduce chunk size.  
+- **Empty PDF text** → Likely scanned; OCR first.  
+- **Out-of-memory** → Close apps, use smaller model, shrink page ranges or chunk sizes.  
+- **Non-JSON outline (v3/v4)** → Retry; switch model; the agents attempt self-repair/fallbacks.
 
-## ✅ Acceptance Checklists
-
-**v2 (performance & beautify)**
-- [ ] PyMuPDF reader path with page ranges (fallback to pypdf)
-- [ ] Parsing cache by file hash + page ranges
-- [ ] Faster chunking + optional parallel parse
-- [ ] Slide theme presets and improved spacing/auto‑fit
-- [ ] References slide (optional)
-- [ ] Better progress logs and errors for scanned PDFs
-
-**v3 (features & robustness)**
-- [ ] “Summary only” command writes `notes.txt`
-- [ ] “Summary separately” per section/page‑range
-- [ ] Async/streamed parse for large PDFs
-- [ ] Retry/self‑repair for JSON outline and slide densify
-- [ ] Theming API + image placeholders
-- [ ] Multi‑document synthesis & citations slide
-- [ ] Export artifacts (`notes.txt`, `outline.json`) per run
-
----
-
-## 📝 Licensing
-
-Each version currently references MIT‑style licensing—confirm for your organization and update as needed.
-
----
-
-## 🙌 Credits
-
-- **version1** pipeline and CLI: slides from topic/PDF with `python-pptx` and local LLM. fileciteturn2file2  
-- **version2** lightweight agent with tool‑calling and auto model detection. fileciteturn2file1  
-- **version3** LangGraph state machine with planner, robust outline JSON, and densification utilities. fileciteturn2file0
