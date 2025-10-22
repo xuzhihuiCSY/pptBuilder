@@ -3,21 +3,10 @@ import os, json, re
 from typing import TypedDict, Optional, List, Dict, Any, Literal
 
 # --- LangChain / LangGraph ---
-from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline, AutoConfig
-import torch
-from langchain_huggingface import ChatHuggingFace, HuggingFacePipeline
+from langchain_ollama import ChatOllama
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from langchain_core.runnables import RunnableLambda
 from langgraph.graph import StateGraph, END
-# --- imports ---
-import os
-
-try:
-    from langchain_community.chat_models import ChatLlamaCpp as _ChatLlamaCpp
-    HAVE_CHAT_LLAMA = True
-except Exception:
-    HAVE_CHAT_LLAMA = False
-    from langchain_community.llms import LlamaCpp as _LlamaCpp
 
 # --- Tools ---
 from pydantic import BaseModel, Field
@@ -26,16 +15,9 @@ import fitz  # PyMuPDF
 from pptx import Presentation
 import pathlib
 import math
-from functools import lru_cache
 
 GENERIC_TITLE_PAT = re.compile(r"^(topic|section|slide)\s*\d+\b", re.I)
-CHATML_BOS = ""
-CHATML_ASSISTANT_PREFIX = "<|im_start|>assistant\n"
-CHATML_STOP = ["<|im_end|>", "<|im_start|>"]
-try:
-    from transformers import BitsAndBytesConfig
-except Exception:
-    BitsAndBytesConfig = None
+KEEP_OUTLINE_AFTER_BUILD = os.getenv("KEEP_OUTLINE_AFTER_BUILD", "0") != "0"
 # =============================================================
 # 1) Tool Implementations (pure Python + small LLM helpers)
 # =============================================================
@@ -46,155 +28,15 @@ class ReadPDFIn(BaseModel):
     mode: Optional[str] = Field(default="fast", description='Reading mode: "fast" or "full".')
     verbose: Optional[bool] = Field(default=True, description="Print progress while reading")
 
-@lru_cache(maxsize=1)
-def get_llm_singleton(temp: float = 0.2, num_predict: int = 320):
-    use_llama = os.getenv("USE_LLAMA_CPP", "0") == "1"
-    if use_llama:
-        model_path = os.getenv("LLAMA_CPP_MODEL", "qwen2.5-7b-instruct-q4_k_m.gguf")
-        if not os.path.isabs(model_path):
-            model_path = os.path.join(os.path.dirname(__file__), model_path)
-        if os.path.exists(model_path):
-            return get_llm_llamacpp(temp=temp, num_predict=num_predict)
-        else:
-            print(f"[warn] GGUF not found at {model_path}; falling back to HF.")
-    return get_llm_20b(temp=temp, num_predict=num_predict)
-
-def _to_chatml(messages, default_system="You are a helpful assistant."):
-    sys_txt = default_system
-    # Extract an explicit system message if present
-    for m in messages:
-        typ = getattr(m, "type", getattr(m, "_lc_kwargs", {}).get("type", "human"))
-        if typ == "system":
-            sys_txt = m.content
-            break
-
-    parts = [CHATML_BOS]
-    # system
-    parts.append("<|im_start|>system\n" + sys_txt + "\n<|im_end|>")
-    # rest
-    for m in messages:
-        typ = getattr(m, "type", getattr(m, "_lc_kwargs", {}).get("type", "human"))
-        if typ == "human":
-            parts.append("<|im_start|>user\n" + m.content + "\n<|im_end|>")
-        elif typ == "ai":
-            parts.append("<|im_start|>assistant\n" + m.content + "\n<|im_end|>")
-
-    # assistant prompt to continue
-    parts.append(CHATML_ASSISTANT_PREFIX)
-    return "\n".join(parts)
-
-
-class _ChatMLAdapter:
-    """Wraps base LlamaCpp to accept LangChain chat messages via .invoke(messages)."""
-    def __init__(self, llm, default_system="You are a helpful assistant."):
-        self.llm = llm
-        self.default_system = default_system
-
-    def invoke(self, messages):
-        prompt = _to_chatml(messages, self.default_system)
-        # Pass stop tokens so model doesn't ramble past <|im_end|>
-        return self.llm.invoke(prompt, stop=CHATML_STOP)
-
-
-def get_llm_llamacpp(
-    temp: float = 0.2,
-    num_predict: int = 320,
-    n_ctx: int = int(os.getenv("LLAMA_CPP_N_CTX", "32768")),  # give more headroom
-):
-    model_path = os.getenv("LLAMA_CPP_MODEL", "qwen2.5-7b-instruct-q4_k_m.gguf")
-    if not os.path.isabs(model_path):
-        model_path = os.path.join(os.path.dirname(__file__), model_path)
-
-    n_gpu_layers = int(os.getenv("LLAMA_CPP_N_GPU_LAYERS", "-1"))
-    n_threads = int(os.getenv("LLAMA_CPP_N_THREADS", "0")) or None
-    n_batch = int(os.getenv("LLAMA_CPP_N_BATCH", "512"))  # silence n_batch warning
-
-    if HAVE_CHAT_LLAMA:
-        # Newer LC wrapper – tell it the expected chat format is ChatML
-        return _ChatLlamaCpp(
-            model_path=model_path,
-            temperature=temp,
-            max_tokens=num_predict,
-            n_ctx=n_ctx,
-            n_gpu_layers=n_gpu_layers,
-            n_threads=n_threads,
-            n_batch=n_batch,
-            f16_kv=True,
-            top_p=0.9,
-            repeat_penalty=1.05,
-            verbose=False,
-            chat_format="chatml",           # <— important
-            stop=CHATML_STOP,               # <— important
-        )
-    else:
-        # Base LLM + ChatML adapter
-        llm = _LlamaCpp(
-            model_path=model_path,
-            temperature=temp,
-            max_tokens=num_predict,
-            n_ctx=n_ctx,
-            n_gpu_layers=n_gpu_layers,
-            n_threads=n_threads,
-            n_batch=n_batch,
-            f16_kv=True,
-            top_p=0.9,
-            repeat_penalty=1.05,
-            verbose=False,
-        )
-        return _ChatMLAdapter(llm)
-
 
 def get_llm_20b(temp: float = 0.2, num_predict: int = 320):
-    import os, warnings
-    model_id = os.getenv("HF_MODEL_ID", "Qwen/Qwen2.5-7B-Instruct")
-    want_4bit = os.getenv("HF_LOAD_4BIT", "0") == "1"
-
-    tok = AutoTokenizer.from_pretrained(model_id, use_fast=True)
-    cfg = AutoConfig.from_pretrained(model_id)
-
-    qcfg = getattr(cfg, "quantization_config", None)
-    is_mxfp4 = False
-    if qcfg:
-        qt = getattr(qcfg, "quant_method", None) or getattr(qcfg, "quantization_method", None) or getattr(qcfg, "quant_type", None)
-        is_mxfp4 = str(qt).lower().startswith("mxfp4")
-
-    load_kwargs = dict(device_map="auto")
-    if is_mxfp4:
-        load_kwargs.update(dtype=torch.bfloat16)
-        model = AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs)
-    else:
-        if want_4bit and BitsAndBytesConfig is not None:
-            quant_cfg = BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_use_double_quant=True,
-                bnb_4bit_quant_type="nf4",
-                bnb_4bit_compute_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
-            )
-            model = AutoModelForCausalLM.from_pretrained(
-                model_id,
-                quantization_config=quant_cfg,
-                device_map="auto",
-            )
-        else:
-            dtype = torch.float16 if torch.cuda.is_available() else torch.float32
-            model = AutoModelForCausalLM.from_pretrained(model_id, dtype=dtype, device_map="auto")
-
-    gen_pipe = pipeline(
-        task="text-generation",
-        model=model,
-        tokenizer=tok,
-        max_new_tokens=int(os.getenv("HF_MAX_NEW_TOKENS", str(num_predict))),
-        do_sample=(temp > 0),
+    return ChatOllama(
+        model=os.getenv("OLLAMA_MODEL", "gpt-oss:20b"),
+        base_url=os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434"),
         temperature=temp,
-        top_p=0.9,
-        repetition_penalty=1.05,
-        pad_token_id=tok.eos_token_id,
-        eos_token_id=tok.eos_token_id,
+        num_predict=num_predict,
+        model_kwargs={"num_ctx": 2048}
     )
-
-    hf_llm = HuggingFacePipeline(pipeline=gen_pipe)
-    return ChatHuggingFace(llm=hf_llm)
-
 
 def read_pdf(path: str,
              pages: Optional[str] = None,
@@ -202,6 +44,7 @@ def read_pdf(path: str,
              max_chars: Optional[int] = None,
              max_pages: Optional[int] = None,
              verbose: bool = True) -> str:
+
     import os, fitz, re
     if verbose:
         print(f"[read_pdf] path: {path}")
@@ -274,6 +117,128 @@ ReadPDF = StructuredTool.from_function(
     ),
     args_schema=ReadPDFIn,
 )
+def synthesize_details_from_topic_title(title: str, topic: str, k: int = 4) -> list[str]:
+    t = (topic or "Topic").strip()
+    ttl = (title or "").strip()
+
+    # Basic guards
+    def _dedupe(lines):
+        seen = set()
+        out = []
+        for x in lines:
+            x = re.sub(r"\s+", " ", x.strip())
+            if not x:
+                continue
+            key = x.lower()
+            if key in seen:
+                continue
+            if key in {t.lower(), ttl.lower()}:
+                continue
+            seen.add(key)
+            out.append(x)
+        return out
+
+    # Heuristic buckets by title intent
+    if re.search(r"\bwhat is\b|\boverview\b|^introduction$|^basics$", ttl, re.I):
+        lines = [
+            f"Definition of {t} and core concept",
+            f"How {t} fits into everyday contexts",
+            f"Common terminology related to {t}",
+            f"High-level scope and boundaries for {t}",
+            f"Where to learn more about {t} (briefly)",
+        ]
+    elif re.search(r"\bhistory|origin|evolution|timeline\b", ttl, re.I):
+        lines = [
+            f"Early domestication/first evidence of {t}",
+            f"Key milestones in the development of {t}",
+            f"Major figures or regions shaping {t}",
+            f"Modern era changes influencing {t}",
+            f"Current state compared to the past for {t}",
+        ]
+    elif re.search(r"\bcharacteristic|feature|anatomy|behavior|property\b", ttl, re.I):
+        lines = [
+            f"Notable physical/structural traits of {t}",
+            f"Behavioral or functional characteristics of {t}",
+            f"How {t}'s traits vary by type or context",
+            f"Typical lifecycle or phases for {t}",
+            f"How to observe or measure these traits in {t}",
+        ]
+    elif re.search(r"\bexample|use case|application|scenario\b", ttl, re.I):
+        lines = [
+            f"Everyday examples of {t} in practice",
+            f"Professional/industry scenarios using {t}",
+            f"Edge cases that test limits of {t}",
+            f"Success stories demonstrating {t}",
+            f"Common pitfalls seen in these examples of {t}",
+        ]
+    elif re.search(r"\bbenefit|advantage|challenge|limitation|risk\b", ttl, re.I):
+        lines = [
+            f"Key benefits achieved with {t}",
+            f"Trade-offs and limitations of {t}",
+            f"Risks or failure modes when using {t}",
+            f"How to mitigate common challenges with {t}",
+            f"Decision criteria: when {t} is vs. isn’t a fit",
+        ]
+    elif re.search(r"\bbest practice|tip|guideline|do|don’t\b", ttl, re.I):
+        lines = [
+            f"Preparation and prerequisites for {t}",
+            f"Core principles to follow with {t}",
+            f"Common mistakes to avoid using {t}",
+            f"Quality checks and evaluation for {t}",
+            f"Maintenance and continuous improvement for {t}",
+        ]
+    elif re.search(r"\btrend|statistic|metric|data|number\b", ttl, re.I):
+        lines = [
+            f"Important metrics relevant to {t}",
+            f"Recent trends or growth areas in {t}",
+            f"Comparative benchmarks for {t}",
+            f"Typical ranges/targets used with {t}",
+            f"Data sources or reports tracking {t}",
+        ]
+    elif re.search(r"\btool|resource|framework|library|dataset\b", ttl, re.I):
+        lines = [
+            f"Essential tools or resources for {t}",
+            f"Selection criteria when choosing tools for {t}",
+            f"Setup and quick-start for key tools in {t}",
+            f"Integration considerations in {t} workflows",
+            f"Where to find docs, tutorials, and support for {t}",
+        ]
+    elif re.search(r"\bcase study|in action|case\b", ttl, re.I):
+        lines = [
+            f"Background and goals for a {t} case",
+            f"Approach and process used with {t}",
+            f"Outcomes and measurable results for {t}",
+            f"Lessons learned applying {t}",
+            f"How to replicate or adapt this case of {t}",
+        ]
+    elif re.search(r"\bfurther reading|reference|learn more\b", ttl, re.I):
+        lines = [
+            f"Beginner-friendly intros to {t}",
+            f"In-depth articles or books on {t}",
+            f"Communities/forums that discuss {t}",
+            f"Datasets or repos related to {t}",
+            f"Conferences/courses covering {t}",
+        ]
+    elif re.search(r"\bconclusion|takeaway|summary\b", ttl, re.I):
+        lines = [
+            f"Key takeaways about {t}",
+            f"Most important limitations for {t}",
+            f"Immediate next steps to explore {t}",
+            f"Pointers to practice {t} safely/effectively",
+            f"Final thoughts on impact of {t}",
+        ]
+    else:
+        # Generic fallback
+        lines = [
+            f"Definition and scope of {t}",
+            f"Why {t} matters in practice",
+            f"Common categories or types of {t}",
+            f"Typical use cases involving {t}",
+            f"Limitations and open questions for {t}",
+        ]
+
+    lines = _dedupe(lines)
+    return lines[:max(3, k)]
 
 # --- Summarize (uses the same Ollama LLM behind the scenes) ---
 class SummarizeIn(BaseModel):
@@ -312,7 +277,7 @@ def summarize_text(text: str,
         note = f" ({', '.join(cap_note)})" if cap_note else ""
         print(f"[summ] map: {len(chunks)} chunk(s){note}")
 
-    llm_map = get_llm_singleton(temp=0.2, num_predict=320)
+    llm_map = get_llm_20b(temp=0.2, num_predict=260)
     partials = []
     map_prompt_tpl = (
         "Summarize the following technical text in ~120 words. "
@@ -331,7 +296,7 @@ def summarize_text(text: str,
         print(f"[summ] reduce: combining {len(partials)} partial(s) …")
 
     def _reduce(num_predict: int, tgt_words: int, stronger: bool = False) -> str:
-        llm_red = get_llm_singleton(temp=0.2, num_predict=num_predict)
+        llm_red = get_llm_20b(temp=0.2, num_predict=num_predict)
         tgt = max(250, min(900, tgt_words))
         if stronger:
             reduce_prompt = (
@@ -365,7 +330,7 @@ def summarize_text(text: str,
             print("[summ] reduce empty — using fallback join+squeeze …")
         joined = " ".join(partials[: min(10, len(partials))])
         # One last pass to compress joined partials into a single paragraph
-        llm_fallback = get_llm_singleton(temp=0.2, num_predict=1200)
+        llm_fallback = get_llm_20b(temp=0.2, num_predict=1200)
         fb_prompt = (
             "Condense the following text into a clear 300–450 word executive summary. "
             "No bullets or headings; write fluent paragraphs; avoid repetition:\n\n" + joined
@@ -402,7 +367,8 @@ class OutlineIn(BaseModel):
     verbose: bool = Field(default=True, description="If true, print per-step outline progress to console.")
 
 def densify_slide_with_llm(title: str, topic: str, notes: str, max_points: int = 5) -> tuple[str, list[str]]:
-    llm = get_llm_singleton(temp=0.3, num_predict=400)
+    model = os.environ.get("OLLAMA_MODEL", "gpt-oss:20b")
+    llm = ChatOllama(model=model, temperature=0.3)
     prompt = (
         "Improve ONE presentation slide.\n"
         "Return STRICT JSON ONLY:\n"
@@ -434,13 +400,14 @@ def slide_outline_json(notes: Optional[str] = None,
                        slide_target: int = 11,
                        topic: Optional[str] = None,
                        verbose: bool = True) -> Dict[str, Any]:
-    import json, os, re, datetime
+    import json, os, re
 
     def log(msg: str):
         if verbose:
             print(msg)
 
-    llm = get_llm_singleton(temp=0.2, num_predict=900)
+    model = os.environ.get("OLLAMA_MODEL", "gpt-oss:20b")
+    llm = ChatOllama(model=model, temperature=0.2)
 
     def _clean(s: str) -> str:
         return re.sub(r"^[\s\*\-•·]+", "", str(s or "")).strip()
@@ -449,8 +416,20 @@ def slide_outline_json(notes: Optional[str] = None,
         m = re.search(r"\{[\s\S]*\}$", text.strip())
         return (m.group(0) if m else text).strip()
 
-    # ---------- Build prompt (two paths) ----------
-    raw = ""  # always defined
+    def _drop_topic_or_title(details_list, title, topic):
+        out = []
+        t_l = (topic or "").strip().lower()
+        ti_l = (title or "").strip().lower()
+        for d in details_list or []:
+            dd = re.sub(r"\s+", " ", d or "").strip()
+            if not dd:
+                continue
+            if dd.lower() in {t_l, ti_l}:
+                continue
+            out.append(dd)
+        return out
+    
+    raw = ""
     if notes and notes.strip():
         log(f"[outline] mode=notes  target={slide_target}")
         schema_text = (
@@ -462,14 +441,11 @@ def slide_outline_json(notes: Optional[str] = None,
             "You are an expert presentation writer.\n"
             "Return JSON ONLY matching this schema:\n" + schema_text + "\n\n"
             f"- EXACTLY {slide_target} slides.\n"
-            "- Slide 1: Welcome/Title slide with a strong deck_title (also use it as slide 1 title) + short subtitle; details empty.\n"
-            "- Slides 2..(N-2): 3–5 concise, factual details each.\n"
-            "- Titles must be specific (avoid 'Topic 1/2/...'). Prefer titles hinting key findings or comparisons.\n"
-            "- Slide (N-1): Conclusion (3–5 takeaways).\n"
-            "- Slide N: Thanks for Watching (no details).\n"
-            "- Avoid markdown bullets (*, -, •). JSON only, no extra text.\n"
-            "- CRITICAL: When the notes include quantitative data (percentages, counts, dataset sizes, AUROC etc.), "
-            "  preserve numbers verbatim and include at least one quantitative bullet per applicable content slide.\n\n"
+            "- Slide 1: Title slide with a strong deck_title (also use it as slide 1 title) + short subtitle; details empty.\n"
+            "- Slides 2..(N-2): 3–5 concise, factual details each. Titles must be specific—no 'Slide N', 'Topic N'.\n"
+            "- Slide (N-1): Conclusion (3–5 takeaways). Slide N: Thanks for Watching (no details).\n"
+            "- JSON only; no prose; avoid markdown bullets (*, -, •).\n"
+            "- CRITICAL: Preserve quantitative data (percentages, counts, dataset sizes, AUROC, params) verbatim where applicable.\n\n"
             "NOTES:\n" + notes.strip()[:6000]
         )
         log("[outline] drafting raw JSON from notes …")
@@ -488,12 +464,12 @@ def slide_outline_json(notes: Optional[str] = None,
         prompt = (
             "You are a presentation planner. Return JSON ONLY matching this schema:\n" + schema_text + "\n\n"
             f"- EXACTLY {slide_target} slides.\n"
-            "- Slide 1: Welcome/Title slide with a strong deck_title (use it as slide 1 title) + short subtitle; details empty.\n"
-            "- Slides 2..(N-2): 3–5 concise, factual details each. Titles must be specific (no 'Topic 1/2/...').\n"
-            "- Slide (N-1): Conclusion (3–5 takeaways).\n"
-            "- Slide N: Thanks for Watching (no details).\n"
-            "- Avoid markdown bullets (*, -, •). JSON only, no extra text.\n"
-            "- Focus on the given TOPIC (do not produce generic presentation advice).\n\n"
+            "- Slide 1: Title slide with a strong, topic-specific deck_title (use as slide 1 title) + short subtitle; details empty.\n"
+            "- Slides 2..(N-2): 3–5 concise, factual details each.\n"
+            "- Titles MUST be informative and topic-specific. Do NOT use 'Presentation', 'Slide N', 'Topic N', or placeholders.\n"
+            "- Slide (N-1): Conclusion (3–5 takeaways). Slide N: Thanks for Watching (no details).\n"
+            "- JSON only; no extra text; avoid markdown bullets (*, -, •).\n"
+            "- Focus strictly on the given TOPIC.\n\n"
             f"TOPIC: {topic}\n"
         )
         log("[outline] drafting raw JSON from topic …")
@@ -502,7 +478,6 @@ def slide_outline_json(notes: Optional[str] = None,
         except Exception:
             raw = '{"deck_title":"Presentation","slides":[]}'
 
-    # ---------- Parse JSON robustly ----------
     log("[outline] parsing JSON …")
     json_text = extract_json(raw)
     try:
@@ -515,15 +490,17 @@ def slide_outline_json(notes: Optional[str] = None,
             data = {"deck_title": (topic or "Presentation"), "slides": []}
 
     deck_title = _clean(data.get("deck_title") or (topic or "Presentation"))
+    if GENERIC_TITLE_PAT.match(deck_title) or deck_title.lower() in {"presentation", "slide", "slides"}:
+        deck_title = (topic or "Presentation").strip().title()
+
     slides = data.get("slides") or []
     log(f"[outline] parsed slides: {len(slides)}")
 
-    # ---------- Normalize slides & enforce structure ----------
+    # normalize to requested count
     cleaned: List[Dict[str, Any]] = []
     total = slide_target
     log(f"[outline] normalizing {total} slides …")
     for i in range(1, total + 1):
-        # take from model output if present; else create a stub
         sl = slides[i-1] if i-1 < len(slides) else {}
         title = _clean(sl.get("title", f"Slide {i}"))
         subtitle = _clean(sl.get("subtitle", ""))
@@ -533,8 +510,7 @@ def slide_outline_json(notes: Optional[str] = None,
             title = deck_title
             details = []
         elif i == max(2, total - 1):
-            if not re.search(r"conclusion|takeaway|summary", title, re.I):
-                title = "Conclusion"
+            title = "Conclusion" if not re.search(r"conclusion|takeaway|summary", title, re.I) else title
             if len(details) < 3:
                 details = ["(add point)"] * 3
         elif i == total:
@@ -545,16 +521,17 @@ def slide_outline_json(notes: Optional[str] = None,
                 details += ["(add point)"] * (3 - len(details))
             details = details[:5]
 
+        details = _drop_topic_or_title(details, title, topic if not (notes and notes.strip()) else "")
         cleaned.append({"title": title, "subtitle": subtitle, "details": details})
         log(f"[outline] slide {i}/{total}: {title}")
 
-    # ---------- Inject quantitative bullets if we have notes ----------
+    # numeric bullets injection (notes mode)
     if notes and notes.strip():
         log("[outline] injecting quantitative bullets …")
         quant_pool = extract_quant_facts(notes, max_items=40)
         if quant_pool:
             qi = 0
-            for i in range(2, max(2, total - 1)):        # slides 2..(N-2)
+            for i in range(2, max(2, total - 1)):
                 det = cleaned[i-1].get("details") or []
                 has_number = any(re.search(r"\d", d) for d in det)
                 if not has_number and qi < len(quant_pool):
@@ -563,7 +540,15 @@ def slide_outline_json(notes: Optional[str] = None,
                 cleaned[i-1]["details"] = det
             log(f"[outline] injected numeric bullets: {qi}")
 
-    # ---------- Polish ----------
+    # topic-mode: replace generic middle titles from a skeleton
+    if not (notes and notes.strip()):
+        titles = _topic_skeleton(topic, total)
+        for i in range(2, max(2, total-1)):
+            t = (cleaned[i-1]["title"] or "").lower()
+            if GENERIC_TITLE_PAT.match(cleaned[i-1]["title"]) or t in {"slide 2","slide 3","presentation"}:
+                cleaned[i-1]["title"] = titles[i-2]
+
+    # polish + allocate
     src_for_polish = (notes or topic or "")
     log("[outline] polishing …")
     cleaned = polish_outline(cleaned, src_for_polish)
@@ -575,11 +560,79 @@ def slide_outline_json(notes: Optional[str] = None,
 
 # --- Build PPT ---
 class BuildIn(BaseModel):
-    outline_json: Dict[str, Any] = Field(..., description="Slide outline JSON")
-    path: str = Field(default="output.pptx", description="Output path for .pptx")
+    outline_json: Dict[str, Any]
+    path: str = Field(default="output.pptx")
+    template: Optional[str] = Field(
+        default=None,
+        description='Template to use: "research" or "relax" (defaults to auto-pick)'
+    )
 
-def build_ppt(outline_json: Dict[str, Any], path: str = "output.pptx") -> str:
-    prs = Presentation()
+def build_ppt(
+    outline_json: Dict[str, Any],
+    path: str = "output.pptx",
+    template: Optional[str] = None,   # <-- accept it here
+) -> str:
+    import os, re
+    here = os.path.dirname(os.path.abspath(__file__))
+
+    def _find(fname: str) -> Optional[str]:
+        for base in (os.path.join(here, "templates"), here):
+            p = os.path.join(base, fname)
+            if os.path.exists(p):
+                return p
+        return None
+
+    # allow env override; else arg; else auto-pick
+    pick = (os.getenv("PPT_TEMPLATE_NAME") or (template or "")).strip().lower()
+
+    def _auto_pick() -> str:
+        title = (outline_json or {}).get("deck_title", "")
+        slides = " ".join(
+            (s.get("title","") + " " + " ".join(s.get("details", [])))
+            for s in (outline_json or {}).get("slides", [])
+        ).lower()
+        researchy = any(k in slides + " " + title.lower() for k in
+                        ["research","method","dataset","experiment","results","evaluation","metrics","limitations","future work"])
+        return "research" if researchy else "relax"
+
+    if not pick:
+        pick = _auto_pick()
+
+    fname_base = "template_research" if pick == "research" else "template_relax"
+
+    pptx_path = _find(fname_base + ".pptx")
+    potx_path = _find(fname_base + ".potx")
+
+    if potx_path and not pptx_path:
+        print("[build] WARNING: Found .potx, but python-pptx cannot open .potx directly. "
+            "Please open the .potx in PowerPoint and Save As a .pptx with NO slides.")
+
+    tpath = pptx_path  # only use .pptx; ignore .potx here
+    prs = Presentation(tpath) if tpath else Presentation()
+
+    print(f"[build] template pick={pick} file={os.path.basename(tpath) if tpath else '(blank)'} "
+        f"path={tpath or '(blank default)'}")
+
+    # --- Layout helpers: pick by name, not by hard indices ---
+    def _layout_contains(prs, names: list[str], default_idx: int) -> Any:
+        wanted = [n.lower() for n in names]
+        for lo in prs.slide_layouts:
+            nm = (getattr(lo, "name", "") or "").lower()
+            if any(w in nm for w in wanted):
+                return lo
+        return prs.slide_layouts[default_idx]  # fallback
+
+    title_layout = _layout_contains(
+        prs,
+        names=["title slide", "cover", "title"],
+        default_idx=0
+    )
+    content_layout = _layout_contains(
+        prs,
+        names=["title and content", "content", "bullets", "text"],
+        default_idx=1
+    )
+
 
     def clean_line(s: str) -> str:
         return re.sub(r"^[\s\*\-•·]+", "", s or "").strip()
@@ -592,7 +645,6 @@ def build_ppt(outline_json: Dict[str, Any], path: str = "output.pptx") -> str:
                   {"title": "Conclusion", "subtitle": "", "details": ["(add point)", "(add point)", "(add point)"]},
                   {"title": "Thanks for Watching", "subtitle": "", "details": []}]
 
-    # Prefer deck_title for filename; fallback to slide 1/2
     name_source = deck_title or clean_line(slides[0].get("title", "")) or (clean_line(slides[1].get("title", "")) if len(slides) > 1 else "Presentation")
     safe_title = re.sub(r"[^\w\-]+", "_", name_source).strip("_") or "Presentation"
     if not path or path == "output.pptx":
@@ -612,11 +664,10 @@ def build_ppt(outline_json: Dict[str, Any], path: str = "output.pptx") -> str:
 
         is_welcome = (idx == 1)
         is_thanks  = (idx == total)
-        is_concl   = (idx == max(2, total-1))
 
         if is_welcome:
             layout = prs.slide_layouts[0]
-            s = prs.slides.add_slide(layout)
+            s = prs.slides.add_slide(title_layout)
             s.shapes.title.text = title
             if len(s.placeholders) > 1:
                 s.placeholders[1].text = subtitle
@@ -630,20 +681,18 @@ def build_ppt(outline_json: Dict[str, Any], path: str = "output.pptx") -> str:
                 box.text_frame.text = subtitle or ""
             continue
 
-        layout = prs.slide_layouts[1]
-        s = prs.slides.add_slide(layout)
+        #layout = prs.slide_layouts[1]
+        s = prs.slides.add_slide(content_layout)
         s.shapes.title.text = title
         body = s.placeholders[1]
 
         if is_thanks:
-            # Thanks slide should have no bullets
             body.text = subtitle or ""
             continue
 
-        # Non-thanks slides: enforce at least 3 bullets on regular and conclusion
         if not details:
             details = ["(add point)", "(add point)", "(add point)"]
-        elif (not is_welcome) and (not is_thanks) and len(details) < 3:
+        elif len(details) < 3:
             details += ["(add point)"] * (3 - len(details))
 
         tf = body.text_frame
@@ -656,6 +705,7 @@ def build_ppt(outline_json: Dict[str, Any], path: str = "output.pptx") -> str:
 
     prs.save(path)
     return os.path.abspath(path)
+
 
 
 Build = StructuredTool.from_function(
@@ -694,6 +744,7 @@ class AgentState(TypedDict, total=False):
     next_action: Optional[str]
     next_args: Optional[Dict[str, Any]]
     auto: bool                             # if True, don't ask before building
+    last_outline: Optional[Dict[str, Any]]
 
 # Helper to get last user message
 def last_user_text(state: AgentState) -> str:
@@ -701,6 +752,18 @@ def last_user_text(state: AgentState) -> str:
         if m["role"] == "user":
             return m["content"]
     return ""
+
+def synthesize_details_from_topic(topic: str, k: int = 4) -> list[str]:
+    t = (topic or "Topic").strip()
+    base = re.sub(r"\s+", " ", t)
+    lines = [
+        f"Definition and scope of {base}",
+        f"Why {base} matters in practice",
+        f"Common categories or types of {base}",
+        f"Typical use cases involving {base}",
+        f"Limitations and open questions for {base}",
+    ]
+    return lines[:max(3, k)]
 
 BAD_PHRASE_PAT = re.compile(
     r"(?i)\b(key takeaways include:|conclusion/key takeaways|conclusion:|^[-*•]+\s*$|\*\*|^\*|\s\*$)"
@@ -750,48 +813,97 @@ def compress_details(lines: list[str], min_keep: int = 3, max_keep: int = 5, sim
         out.append("(add point)")
     return out[:max_keep]
 
-def polish_outline(cleaned: list[Dict[str, Any]], notes: str) -> list[Dict[str, Any]]:
-    if not cleaned: return cleaned
+def polish_outline(cleaned: list[Dict[str, Any]], notes_or_topic: str) -> list[Dict[str, Any]]:
+    if not cleaned:
+        return cleaned
     n = len(cleaned)
-    # Fix middle slides (2..n-2)
+    topic_mode = not (notes_or_topic and "\n" in notes_or_topic)  # crude: notes usually multi-line; topic is short
+    the_topic = notes_or_topic.strip()
+
+    def _strip_bad(details, title):
+        out = []
+        title_l = (title or "").strip().lower()
+        topic_l = (the_topic or "").lower()
+        for d in details or []:
+            dd = re.sub(r"\s+", " ", d or "").strip()
+            if not dd:
+                continue
+            if dd.lower() in {title_l, topic_l}:
+                continue
+            out.append(dd)
+        return out
+
+    # Middle slides (2..n-2)
     for i in range(1, max(1, n-2)):
         sl = cleaned[i]
-        sl["title"] = repair_title(sl.get("title", ""), notes)
-        details = sl.get("details") or []
+        sl["title"] = repair_title(sl.get("title", ""), notes_or_topic)
+        details = _strip_bad(sl.get("details"), sl["title"])
         details = compress_details(details, min_keep=3, max_keep=5)
-        if all("(add point)" in d for d in details):
-            # synthesize from notes if still empty-ish
-            details = synthesize_details_from_notes(sl["title"], notes, k=4)
-            details = compress_details(details, min_keep=3, max_keep=5)
-        sl["details"] = details
 
-    # Ensure Conclusion (n-1)
+        # If placeholders or too thin, densify
+        if topic_mode:
+            if len(details) < 3 or all("(add point)" in d for d in details):
+                details = synthesize_details_from_topic_title(sl["title"], the_topic, k=5)
+        else:
+            if len(details) < 3 or all("(add point)" in d for d in details):
+                details = compress_details(
+                    synthesize_details_from_notes(sl["title"], notes_or_topic, k=5),
+                    min_keep=3, max_keep=5
+                )
+
+        sl["details"] = details[:5]
+
+    # Conclusion (n-1)
     if n >= 2:
         concl = cleaned[-2]
         concl["title"] = "Conclusion"
-        concl["details"] = compress_details(
-            concl.get("details") or synthesize_details_from_notes("Key takeaways", notes, k=4),
-            min_keep=3, max_keep=5
-        )
+        det = _strip_bad(concl.get("details"), concl["title"])
+        if topic_mode and (len(det) < 3 or all("(add point)" in d for d in det)):
+            det = synthesize_details_from_topic_title("Conclusion", the_topic, k=5)
+        elif not topic_mode and (len(det) < 3 or all("(add point)" in d for d in det)):
+            det = synthesize_details_from_notes("Key takeaways", notes_or_topic, k=5)
+        concl["details"] = compress_details(det, min_keep=3, max_keep=5)[:5]
 
-    # Ensure Thanks (n)
+    # Thanks (n)
     cleaned[-1]["title"] = "Thanks for Watching"
     cleaned[-1]["details"] = []
 
-    # Welcome (1): keep subtitle tidy
-    cleaned[0]["subtitle"] = re.sub(r"\s+", " ", (cleaned[0].get("subtitle") or f"An overview of {cleaned[0].get('title','')}")).strip()
+    # Welcome (1)
+    cleaned[0]["subtitle"] = re.sub(
+        r"\s+"," ", (cleaned[0].get("subtitle") or f"An overview of {cleaned[0].get('title','')}")).strip()
     cleaned[0]["details"] = []
     return cleaned
 
-def repair_title(t: str, notes: str) -> str:
+def _topic_skeleton(topic: str, n: int) -> list[str]:
+    base = re.sub(r"\s+", " ", (topic or "Topic")).strip().title()
+    core = [
+        f"What Is {base}?",
+        f"History & Origins of {base}",
+        f"Key Characteristics of {base}",
+        f"Real-World Examples of {base}",
+        f"Benefits & Challenges of {base}",
+        f"Best Practices with {base}",
+        f"Trends & Statistics on {base}",
+        f"Tools & Resources for {base}",
+        f"Case Study: {base} In Action",
+    ]
+    need = max(0, max(2, n-1) - 2)  # slides 2..(n-2)
+    return (core + [f"Further Reading on {base}"] * 10)[:need]
+
+
+def repair_title(t: str, notes_or_topic: str) -> str:
     t = (t or "").strip()
-    if not t or re.fullmatch(r"(have been|dogs highly|highly social|other dogs|dogs also)", t, re.I) or len(t.split()) < 2:
-        # propose a better title from notes’ keyphrases
-        cands = keyphrase_titles_from_notes(notes, 1)
-        return cands[0] if cands else "Key Topic"
-    # title-case and strip junk
+    # Reject empties, one-word titles, and "Slide/Topic/Section N"
+    if not t or len(t.split()) < 2 or GENERIC_TITLE_PAT.match(t):
+        cands = keyphrase_titles_from_notes(notes_or_topic, 1)
+        if cands:
+            return cands[0]
+        topic = (notes_or_topic or "Topic").strip()
+        base = re.sub(r"\s+", " ", topic).title()[:60] or "Topic Overview"
+        return f"{base}: Key Concepts"
     t = re.sub(r"\s+", " ", t)
     return t[0].upper() + t[1:]
+
 
 def extract_pdf_path(text: str) -> str | None:
     """Return a plausible PDF path from a user message (Windows-friendly)."""
@@ -870,31 +982,36 @@ def compress_details_unique(lines: list[str], global_seen: set[str],
         out.append("(add point)")
     return out[:max_keep]
 
-def allocate_details_across_slides(cleaned: list[Dict[str, Any]], notes: str) -> list[Dict[str, Any]]:
-    if not cleaned: return cleaned
+def allocate_details_across_slides(cleaned: list[Dict[str, Any]], notes_or_topic: str) -> list[Dict[str, Any]]:
+    if not cleaned:
+        return cleaned
     n = len(cleaned)
-    global_seen: set[str] = set()
+    topic_mode = not (notes_or_topic and "\n" in notes_or_topic)
+    the_topic = (notes_or_topic or "").strip()
 
-    # Reserve welcome & thanks; seed global_seen with their lines (usually none)
-    for idx in [0, n-1]:
-        for ln in cleaned[idx].get("details", []) or []:
+    global_seen: set[str] = set()
+    def _add_seen(lines):
+        for ln in lines or []:
             global_seen.add(normalize_line_global(ln))
 
-    # Walk through content slides in order, compressing uniquely and filling from notes with exclude=global_seen
-    for i in range(1, max(1, n-1)):
-        if i == n-1:  # thanks
-            break
+    # seed with welcome/thanks
+    _add_seen(cleaned[0].get("details"))
+    _add_seen(cleaned[-1].get("details"))
+
+    # pass 1: ensure 3–5 unique per slide (skip title & thanks)
+    for i in range(1, n-1):
         sl = cleaned[i]
-        if sl.get("title", "").lower() == "conclusion":
-            # handle conclusion last in this loop
+        if sl.get("title", "").lower() == "thanks for watching":
             continue
 
-        # 1) Unique-compress what's there
         uniq = compress_details_unique(sl.get("details") or [], global_seen, min_keep=0, max_keep=5)
 
-        # 2) If <3, synthesize from notes excluding global_seen
+        # If thin, fill via topic-aware or notes-aware synthesis
         if len(uniq) < 3:
-            extra = synthesize_details_from_notes(sl.get("title", ""), notes, k=5-len(uniq), exclude=global_seen)
+            if topic_mode:
+                extra = synthesize_details_from_topic_title(sl.get("title",""), the_topic, k=5-len(uniq))
+            else:
+                extra = synthesize_details_from_notes(sl.get("title",""), notes_or_topic, k=5-len(uniq), exclude=global_seen)
             for e in extra:
                 norm = normalize_line_global(e)
                 if norm in global_seen:
@@ -904,44 +1021,41 @@ def allocate_details_across_slides(cleaned: list[Dict[str, Any]], notes: str) ->
                 if len(uniq) >= 5:
                     break
 
-        # 3) Guarantee 3–5
+        # Fallback: placeholders (rare after above)
         while len(uniq) < 3:
             uniq.append("(add point)")
+
         sl["details"] = uniq[:5]
+        _add_seen(sl["details"])
 
-    # Finally ensure conclusion has unique lines too
-    if n >= 2:
-        concl = cleaned[-2]
-        uniq = compress_details_unique(concl.get("details") or [], global_seen, min_keep=0, max_keep=5)
-        if len(uniq) < 3:
-            extra = synthesize_details_from_notes("Key takeaways", notes, k=5-len(uniq), exclude=global_seen)
-            for e in extra:
-                norm = normalize_line_global(e)
-                if norm in global_seen:
-                    continue
-                uniq.append(e)
-                global_seen.add(norm)
-                if len(uniq) >= 5:
-                    break
-        while len(uniq) < 3:
-            uniq.append("(add point)")
-
-        # NEW: if placeholders remain, try LLM densify, then fallback synthesize without exclude
-        if all("(add point)" in d for d in uniq):
+    # pass 2: optional per-slide LLM densify if still placeholders
+    try:
+        model = os.environ.get("OLLAMA_MODEL", "gpt-oss:20b")
+        llm = ChatOllama(model=model, temperature=0.1)
+        for i in range(1, n-1):
+            sl = cleaned[i]
+            det = sl.get("details") or []
+            if det and not all("(add point)" in d for d in det):
+                continue
+            prompt = (
+                f"Write 4 short, factual bullet phrases for a presentation slide.\n"
+                f"Slide title: {sl.get('title','')}\n"
+                f"Topic: {the_topic}\n"
+                "- No numbering, no markdown bullets.\n"
+                "- Each bullet ≤ 12 words.\n"
+            )
             try:
-                bt, bd = densify_slide_with_llm(sl.get("title",""), cleaned[0].get("title","Presentation"), notes, max_points=5)
-                cand = [clean_detail_line(fix_truncated_line(x, notes)) for x in bd]
-                uniq = [x for x in cand if x][:5] or uniq
+                txt = llm.invoke(prompt).content.strip()
+                cand = [clean_detail_line(x) for x in re.split(r"[\n;•\-]\s*", txt) if clean_detail_line(x)]
+                cand = [c for c in cand if c and c.lower() not in {the_topic.lower(), sl.get('title','').lower()}]
+                if cand:
+                    cleaned[i]["details"] = cand[:5]
             except Exception:
                 pass
-            if all("(add point)" in d for d in uniq):
-                extra = synthesize_details_from_notes(sl.get("title",""), notes, k=5, exclude=set())  # <— no exclude now
-                cand = [clean_detail_line(fix_truncated_line(x, notes)) for x in extra]
-                uniq = [x for x in cand if x][:5] or uniq
+    except Exception:
+        pass
 
-        sl["details"] = uniq[:5]
     return cleaned
-
 
 def keyphrase_titles_from_notes(notes: str, k: int) -> list[str]:
     text = re.sub(r"[^a-z0-9\s]", " ", notes.lower())
@@ -1066,14 +1180,16 @@ def extract_quant_facts(text: str, max_items: int = 20) -> list[str]:
 
 # --- Planner Node: LLM decides next action (which tool/chat/finish) ---
 def planner_node(state: AgentState) -> AgentState:
-    llm = get_llm_singleton(temp=0.0, num_predict=256)
+    model = os.environ.get("OLLAMA_MODEL", "gpt-oss:20b")
+    llm = ChatOllama(model=model, temperature=0)
+
     user_text = last_user_text(state).strip()
     text_l = user_text.lower()
     state["next_action"] = None
     state["next_args"] = {}
 
-    if state.get("ppt_path"):
-        state["next_action"] = "finish"; state["next_args"] = {}; return state
+    # if state.get("ppt_path"):
+    #     state["next_action"] = "finish"; state["next_args"] = {}; return state
 
     def extract_slide_count(s: str, default: int = 11) -> int:
         m = re.search(r"(\d+)\s*(slides?|ppt)", s.lower())
@@ -1088,7 +1204,6 @@ def planner_node(state: AgentState) -> AgentState:
     asks_build_now = "build slides now" in text_l or text_l == "build slides" or "build now" in text_l
 
     slide_target = extract_slide_count(text_l, default=11)
-    state["last_slide_target"] = slide_target
     pdf_path = extract_pdf_path(user_text) if mentions_pdf else None
 
     # --- SUMMARY-ONLY path: read → summarize → finish (no loops)
@@ -1147,7 +1262,6 @@ def planner_node(state: AgentState) -> AgentState:
     # default chat
     state["next_action"] = "chat"; state["next_args"] = {}; return state
 
-# --- Tool Executor Node: run the chosen tool (if any) ---
 def tool_node(state: AgentState) -> AgentState:
     import os, re, json, datetime
     action = (state.get("next_action") or "").strip()
@@ -1157,11 +1271,10 @@ def tool_node(state: AgentState) -> AgentState:
         state = add_message(state, "assistant", "No action planned. Tell me what to do (e.g., `summary only for <pdf>`).")
         state["next_action"] = "finish"; state["next_args"] = {}; return state
 
-    # Prefill
     if action == "summarize_text":
         if not args.get("text"):
             seed = state.get("pdf_text") or f"{last_user_text(state)}\n\nCreate comprehensive notes about this topic for slides."
-            args["text"] = seed  # no clamp
+            args["text"] = seed
         args.setdefault("style", "slides")
         args.setdefault("target_words", 350)
 
@@ -1170,7 +1283,7 @@ def tool_node(state: AgentState) -> AgentState:
             args["topic"] = infer_topic_from_user_text(state)
         args.setdefault("slide_target", 11)
         args.setdefault("verbose", True)
-        
+
     elif action == "build_ppt":
         if not args.get("outline_json"):
             if state.get("outline"):
@@ -1191,7 +1304,11 @@ def tool_node(state: AgentState) -> AgentState:
             result = tool.invoke(args)
         except Exception as e:
             msg = str(e)
-            state = add_message(state, "assistant", f"❌ Tool `{action}` failed: {e}")
+            base = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
+            if "10061" in msg or "ConnectError" in msg or "actively refused" in msg:
+                state = add_message(state, "assistant", f"❌ Can't reach your Ollama server at {base}. Start it with `ollama serve` and try again.")
+            else:
+                state = add_message(state, "assistant", f"❌ Tool `{action}` failed: {e}")
             state["next_action"] = "finish"; state["next_args"] = {}; return state
     else:
         result = None
@@ -1206,11 +1323,10 @@ def tool_node(state: AgentState) -> AgentState:
         summary = (result or "").strip()
         state["notes"] = summary
 
-        if state.get("auto"): 
+        if state.get("auto"):
             state["auto"] = False
             try:
-                target = int(state.get("last_slide_target", 11))
-                outline = TOOLS["slide_outline_json"].invoke({"notes": summary, "slide_target": target})
+                outline = TOOLS["slide_outline_json"].invoke({"notes": summary, "slide_target": 11})
             except Exception as e:
                 state = add_message(state, "assistant", f"Summary ready ✔\n\n{summary}\n\n(Outline failed during auto-chain: {e})")
                 state["next_action"] = "finish"; state["next_args"] = {}; return state
@@ -1222,12 +1338,21 @@ def tool_node(state: AgentState) -> AgentState:
             out_path = os.path.abspath(f"{safe}_{ts}.pptx")
 
             try:
-                out_file = TOOLS["build_ppt"].invoke({"outline_json": outline, "path": out_path})
+                chosen_template = os.getenv("PPT_TEMPLATE_NAME") or None  # e.g., set to "research" or "relax"
+                out_file = TOOLS["build_ppt"].invoke({
+                    "outline_json": outline,
+                    "path": out_path,
+                    "template": chosen_template
+                })
                 state["ppt_path"] = out_file
+                state["last_outline"] = outline
+                if not KEEP_OUTLINE_AFTER_BUILD:
+                    state["outline"] = None
                 state = add_message(state, "assistant", f"Summary ready ✔\n\n{summary}\n\nPPT built ✔ -> {out_file}")
             except Exception as e:
                 pretty = json.dumps(outline, indent=2, ensure_ascii=False)
-                state = add_message(state, "assistant", "Summary ready ✔\n\n" + summary +
+                state = add_message(state, "assistant",
+                                    "Summary ready ✔\n\n" + summary +
                                     "\n\nSlide outline JSON prepared — review below:\n\n```json\n" + pretty + "\n```\n"
                                     f"(Auto-build failed: {e})\nSay **'build slides'** to render.")
         else:
@@ -1244,7 +1369,7 @@ def tool_node(state: AgentState) -> AgentState:
         except Exception:
             saved_note = ""
 
-        if state.get("auto"):  # user said "build slides" → build now
+        if state.get("auto"):
             state["auto"] = False
             deck_title = (outline or {}).get("deck_title") or "Presentation"
             safe = re.sub(r"[^\w\-]+", "_", deck_title).strip("_") or "Presentation"
@@ -1253,31 +1378,43 @@ def tool_node(state: AgentState) -> AgentState:
             try:
                 out_file = TOOLS["build_ppt"].invoke({"outline_json": outline, "path": out_path})
                 state["ppt_path"] = out_file
+                state["last_outline"] = outline
+                if not KEEP_OUTLINE_AFTER_BUILD:
+                    state["outline"] = None
                 state = add_message(state, "assistant", f"Slide outline JSON prepared ✔{saved_note}\n\nPPT built ✔ -> {out_file}")
             except Exception as e:
-                state = add_message(state, "assistant", "Slide outline JSON prepared ✔" + saved_note +
+                state = add_message(state, "assistant",
+                                    "Slide outline JSON prepared ✔" + saved_note +
                                     " — review below:\n\n```json\n" + pretty + "\n```\n"
                                     f"(Auto-build failed: {e})\nSay **'build slides'** to render.")
         else:
             state = add_message(state, "assistant",
-                "Slide outline JSON prepared ✔" + saved_note + " — review below:\n\n```json\n" + pretty + "\n```\n"
+                "Slide outline JSON prepared ✔" + saved_note +
+                " — review below:\n\n```json\n" + pretty + "\n```\n"
                 "Say **'build slides'** to render this outline, or **'regenerate outline'** to try again."
             )
 
     elif action == "build_ppt":
         out_path = result if (isinstance(result, str) and result.lower().endswith(".pptx")) else args.get("path")
         state["ppt_path"] = out_path
+        state["last_outline"] = state.get("outline")
+        if not KEEP_OUTLINE_AFTER_BUILD:
+            state["outline"] = None
         state = add_message(state, "assistant", f"PPT built ✔ -> {out_path}")
 
     elif action == "chat":
-        state = add_message(state, "assistant", "How can I help next? For example:\n - `summary only for \"D:/path/paper.pdf\"`\n - `read \"D:/path/paper.pdf\" pages 1-5 and summarize`\n - `make 10 slides ppt about diffusion models`")
+        state = add_message(state, "assistant",
+            "How can I help next? For example:\n - `summary only for \"D:/path/paper.pdf\"`\n - `read \"D:/path/paper.pdf\" pages 1-5 and summarize`\n - `make 10 slides ppt about diffusion models`"
+        )
 
     state["next_action"] = "finish"; state["next_args"] = {}
     return state
 
 # --- Chat Node: simple chat response (no tools) ---
 def chat_node(state: AgentState) -> AgentState:
-    llm = get_llm_singleton(temp=0.0, num_predict=320)
+    """Plain conversational reply (no tools). Ends the turn via chat→END edge."""
+    model = os.environ.get("OLLAMA_MODEL", "gpt-oss:20b")
+    llm = ChatOllama(model=model, temperature=0)
 
     # Short system guidance to keep answers crisp
     sys = SystemMessage(content=(
@@ -1342,21 +1479,8 @@ def build_app():
 # =============================================================
 
 if __name__ == "__main__":
-    use_llama = os.getenv("USE_LLAMA_CPP", "0") == "1"
-    if use_llama:
-        model_path = os.getenv("LLAMA_CPP_MODEL", "qwen2.5-7b-instruct-q4_k_m.gguf")
-        if not os.path.isabs(model_path):
-            model_path = os.path.join(os.path.dirname(__file__), model_path)
-        n_gpu_layers = os.getenv("LLAMA_CPP_N_GPU_LAYERS", "-1")
-        n_threads = os.getenv("LLAMA_CPP_N_THREADS", "auto")
-        print(f"🧠 Using llama.cpp model: {os.path.basename(model_path)}")
-        print(f"   n_gpu_layers={n_gpu_layers}, n_threads={n_threads}")
-        if not os.path.exists(model_path):
-            print(f"   ⚠️ GGUF not found at: {model_path}")
-    else:
-        hf_id = os.getenv("HF_MODEL_ID", "Qwen/Qwen2.5-7B-Instruct")
-        print(f"🧠 Using HF model: {hf_id}")
-
+    model = os.environ.get("OLLAMA_MODEL", "gpt-oss:20b")
+    print(f"🧠 Using Ollama model: {model}")
     app = build_app()
 
     state: AgentState = {"messages": []}
