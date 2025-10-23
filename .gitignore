@@ -43,10 +43,6 @@ IDE and editor configuration files
 *.sln
 *.sw?
 
-Generated output files
-This will ignore all PowerPoint files created by the agent
-*.pptx
-
 Local data files
 Ignore any PDFs you place in the 'papers' directory for testing
 papers/*.pdf
