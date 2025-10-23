@@ -1,171 +1,287 @@
-
 import os
 import sys
 import threading
 import subprocess
 import queue
-from functools import partial
+
+from kivy.config import Config
+Config.set("kivy", "exit_on_escape", "1")     # allow Esc to quit
+
+from kivy.core.window import Window
+Window.allow_vkeyboard = False   # keep the on-screen keyboard OFF
+Window.softinput_mode = "pan"
 
 from kivy.app import App
 from kivy.clock import Clock
-from kivy.core.window import Window
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.textinput import TextInput
 from kivy.uix.button import Button
 from kivy.uix.label import Label
-from kivy.uix.filechooser import FileChooserIconView
-from kivy.uix.popup import Popup
+from kivy.uix.modalview import ModalView
+from kivy.graphics import Color, RoundedRectangle
+from kivy.utils import get_color_from_hex
 
-# ----------
-# Utilities
-# ----------
+# -----------------
+# Utility & Theming
+# -----------------
 
-def default_script_path():
+APP_TITLE = "PPT Agent Console"
+BG          = get_color_from_hex("#0f1220")
+PANEL       = get_color_from_hex("#171a2b")
+ACCENT      = get_color_from_hex("#6cb4ff")
+ACCENT_DIM  = get_color_from_hex("#3c78b0")
+TEXT        = get_color_from_hex("#e7eaf6")
+MUTED       = get_color_from_hex("#aab1c7")
+DANGER      = get_color_from_hex("#ff6b6b")
+SUCCESS     = get_color_from_hex("#4cd17a")
+
+def script_path_same_dir():
+    here = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(here, "ppt_agent.py")
+
+# ---------------
+# Styled Widgets
+# ---------------
+
+class Pill(Label):
+    def __init__(self, text, color, **kw):
+        super().__init__(text=text, color=TEXT, size_hint=(None, None),
+                         height="26dp", padding=(12, 6), **kw)
+        self.bind(size=self._redraw, pos=self._redraw, texture_size=self._on_tex)
+        self._bg_color = color
+
+    def _on_tex(self, *_):
+        self.width = self.texture_size[0] + 24
+
+    def _redraw(self, *_):
+        self.canvas.before.clear()
+        with self.canvas.before:
+            Color(*self._bg_color)
+            RoundedRectangle(radius=[12], pos=self.pos, size=self.size)
+
+class SolidButton(Button):
+    def __init__(self, text, bg=ACCENT, bg_down=ACCENT_DIM, **kw):
+        super().__init__(text=text, color=TEXT, size_hint=(None, None),
+                         height="36dp", padding=(14, 10), **kw)
+        self.background_normal = ""
+        self.background_down = ""
+        self._bg = bg
+        self._bg_down = bg_down
+        self.bind(state=self._refresh, size=self._refresh, pos=self._refresh)
+
+    def _refresh(self, *_):
+        col = self._bg_down if self.state == "down" else self._bg
+        self.canvas.before.clear()
+        with self.canvas.before:
+            Color(*col)
+            RoundedRectangle(radius=[10], pos=self.pos, size=self.size)
+
+class DangerButton(SolidButton):
+    def __init__(self, text="Stop", **kw):
+        super().__init__(text=text, bg=DANGER, bg_down=get_color_from_hex("#d95959"), **kw)
+
+# ----------------
+# Main UI/Behaviour
+# ----------------
+
+class ConsoleUI(BoxLayout):
     """
-    Try to find ppt_agent.py near this launcher; otherwise return empty string.
+    Minimal, focused console:
+      ┌ Header: Title | Status pill | Start / Stop
+      ├ Terminal (read-only, large font)
+      └ Footer:  [› command input.....................][Send]
     """
-    here = os.path.dirname(os.path.abspath(sys.argv[0]))
-    guess = os.path.join(here, "ppt_agent.py")
-    return guess if os.path.exists(guess) else ""
-
-
-class TerminalRunner(BoxLayout):
-    """
-    Two-part UI:
-      1) Top row: script path input, Start/Stop, command entry + Send.
-      2) Bottom: read-only scrolling text showing the child process stdout/stderr (terminal mirror).
-    """
-
-    def __init__(self, **kwargs):
-        super().__init__(orientation="vertical", spacing=6, padding=8, **kwargs)
-
-        # ---------- Top controls ----------
-        top = BoxLayout(orientation="horizontal", size_hint_y=None, height="40dp", spacing=6)
-
-        self.path_input = TextInput(text=default_script_path(), hint_text="Path to ppt_agent.py", multiline=False)
-        self.browse_btn = Button(text="Browse")
-        self.start_btn = Button(text="Start")
-        self.stop_btn = Button(text="Stop", disabled=True)
-
-        top.add_widget(Label(text="Script:", size_hint_x=None, width="70dp"))
-        top.add_widget(self.path_input)
-        top.add_widget(self.browse_btn)
-        top.add_widget(self.start_btn)
-        top.add_widget(self.stop_btn)
-
-        # Command line row
-        cmdrow = BoxLayout(orientation="horizontal", size_hint_y=None, height="40dp", spacing=6)
-        self.cmd_input = TextInput(hint_text="Type a command for the script (press Enter or click Send)", multiline=False, disabled=True)
-        self.send_btn = Button(text="Send", disabled=True)
-        cmdrow.add_widget(Label(text="Input:", size_hint_x=None, width="70dp"))
-        cmdrow.add_widget(self.cmd_input)
-        cmdrow.add_widget(self.send_btn)
-
-        # ---------- Terminal output ----------
-        # Removed font_name to avoid missing font on some systems.
-        self.terminal = TextInput(readonly=True, text="", size_hint_y=1, cursor_blink=True)
-        self.terminal.hint_text = "Terminal output will appear here..."
-
-        # Layout
-        self.add_widget(top)
-        self.add_widget(cmdrow)
-        self.add_widget(self.terminal)
+    def __init__(self, **kw):
+        super().__init__(orientation="vertical", spacing=10, padding=12, **kw)
+        self._decorate_bg()
 
         # Process state
         self.proc = None
         self.reader_thread = None
         self.output_queue = queue.Queue()
         self._stop_reader = threading.Event()
+        self.waiting_response = False
+
+        # Track the latest fully-formed output line
+        self.last_output_line = ""
+
+        # Header
+        header = BoxLayout(orientation="horizontal", size_hint_y=None, height="46dp", spacing=10)
+        title = Label(text=APP_TITLE, color=TEXT, font_size="18sp", bold=True, size_hint_x=1)
+        self.status_pill = Pill("stopped", color=get_color_from_hex("#2a2e44"))
+        self.start_btn = SolidButton("Start", width="90dp")
+        self.stop_btn = DangerButton("Stop", width="90dp", disabled=True)
+        header.add_widget(title)
+        header.add_widget(self.status_pill)
+        header.add_widget(self.start_btn)
+        header.add_widget(self.stop_btn)
+
+        # Terminal (read-only output)
+        self.terminal = TextInput(
+            text="",
+            readonly=True,
+            cursor_blink=True,
+            size_hint_y=1,
+            background_color=PANEL,
+            foreground_color=TEXT,
+            font_size="15sp",
+            padding=(10, 10),
+        )
+        self.terminal.hint_text = "Output will appear here..."
+        self.terminal.hint_text_color = (MUTED[0], MUTED[1], MUTED[2], 0.8)
+
+        # Footer command bar
+        footer = BoxLayout(orientation="horizontal", size_hint_y=None, height="44dp", spacing=10)
+        self.cmd_label = Label(text="›", color=MUTED, size_hint_x=None, width="18dp", font_size="18sp")
+        self.cmd_input = TextInput(
+            text="",
+            multiline=False,
+            write_tab=False,
+            background_color=get_color_from_hex("#101326"),
+            foreground_color=TEXT,
+            hint_text="Type a command for ppt_agent.py and press Enter",
+            hint_text_color=(MUTED[0], MUTED[1], MUTED[2], 0.7),
+            padding=(10, 10),
+            disabled=True,
+            font_size="15sp",
+        )
+        self.send_btn = SolidButton("Send", width="96dp", bg=ACCENT, bg_down=ACCENT_DIM, disabled=True)
+        footer.add_widget(self.cmd_label)
+        footer.add_widget(self.cmd_input)
+        footer.add_widget(self.send_btn)
+
+        # Loading modal (blocks input)
+        self.loading = ModalView(auto_dismiss=False, background_color=(0, 0, 0, 0.6))
+        self.loading.add_widget(Label(text="Working...", color=TEXT, font_size="20sp", bold=True))
+
+        # Build layout
+        self.add_widget(header)
+        self.add_widget(self.terminal)
+        self.add_widget(footer)
 
         # Bindings
-        self.browse_btn.bind(on_release=self.open_file_dialog)
-        self.start_btn.bind(on_release=self.start_process)
-        self.stop_btn.bind(on_release=self.stop_process)
-        self.send_btn.bind(on_release=self.send_command)
-        self.cmd_input.bind(on_text_validate=lambda *_: self.send_command())
+        self.start_btn.bind(on_release=self._start)
+        self.stop_btn.bind(on_release=self._stop)
+        self.send_btn.bind(on_release=lambda *_: self._send())
+        self.cmd_input.bind(on_text_validate=lambda *_: self._send())
 
-        # Periodic pump to drain the queue into the UI
-        Clock.schedule_interval(self._drain_output_queue, 0.05)
+        # Keyboard: Ctrl+L clears the terminal (optional convenience)
+        Window.bind(on_key_down=self._on_key_down)
 
-    # ---------- File chooser ----------
-    def open_file_dialog(self, *_):
-        chooser = FileChooserIconView(path=os.path.dirname(self.path_input.text) if self.path_input.text else os.getcwd(),
-                                      filters=["*.py"])
-        box = BoxLayout(orientation="vertical", spacing=6, padding=6)
-        box.add_widget(chooser)
-        btns = BoxLayout(size_hint_y=None, height="40dp", spacing=6)
-        ok = Button(text="Use Selected")
-        cancel = Button(text="Cancel")
-        btns.add_widget(ok); btns.add_widget(cancel)
-        box.add_widget(btns)
-        popup = Popup(title="Select ppt_agent.py", content=box, size_hint=(0.9, 0.9))
+        # Pump output queue
+        Clock.schedule_interval(self._drain_output_queue, 0.02)
 
-        def choose_and_close(*_):
-            if chooser.selection:
-                self.path_input.text = chooser.selection[0]
-            popup.dismiss()
-        ok.bind(on_release=choose_and_close)
-        cancel.bind(on_release=lambda *_: popup.dismiss())
-        popup.open()
+        Window.size = (740, 550)
 
-    # ---------- Process control ----------
-    def start_process(self, *_):
+    # ---- visuals
+    def _decorate_bg(self):
+        self.canvas.before.clear()
+        with self.canvas.before:
+            Color(*BG)
+            RoundedRectangle(pos=self.pos, size=self.size, radius=[0, 0, 0, 0])
+        self.bind(size=self._redraw_bg, pos=self._redraw_bg)
+
+    def _redraw_bg(self, *_):
+        self._decorate_bg()
+
+    # ---- loading overlay
+    def _start_loading(self):
+        self.waiting_response = True
+        self.cmd_input.disabled = True
+        self.send_btn.disabled = True
+        if not self.loading.parent:
+            self.loading.open()
+
+    def _stop_loading(self):
+        self.waiting_response = False
+        if self.loading:
+            try:
+                self.loading.dismiss()
+            except Exception:
+                pass
+        # Only re-enable if process is still running
         if self.proc and self.proc.poll() is None:
-            self._append_text("[info] Process already running.\n")
+            self.cmd_input.disabled = False
+            self.send_btn.disabled = False
+
+    def _clear_terminal(self):
+        self.terminal.text = ""
+        self.last_output_line = ""
+        try:
+            while True:
+                self.output_queue.get_nowait()
+        except queue.Empty:
+            pass
+        self._scroll_to_end()
+
+    # ---- process lifecycle
+    def _start(self, *_):
+        if self.proc and self.proc.poll() is None:
+            self._append("[info] process already running\n")
             return
 
-        script_path = self.path_input.text.strip()
-        if not script_path or not os.path.exists(script_path):
-            self._append_text(f"[error] Script not found: {script_path}\n")
+        # clear first, then proceed
+        self._clear_terminal()
+
+        script = script_path_same_dir()
+        if not os.path.exists(script):
+            self._append(f"[error] ppt_agent.py not found next to this file: {script}\n")
+            return
+
+        script = script_path_same_dir()
+        if not os.path.exists(script):
+            self._append(f"[error] ppt_agent.py not found next to this file: {script}\n")
             return
 
         try:
-            # Reset state
-            self.terminal.text = ""
+            # reset
             self._stop_reader.clear()
-
-            # Launch child process: python ppt_agent.py
+            self._stop_loading()  # ensure loader is closed
             env = os.environ.copy()
-            env['PYTHONIOENCODING'] = 'utf-8'
-            env['PYTHONUTF8'] = '1'
-            cmd = [sys.executable, '-X', 'utf8', script_path]
+            env["PYTHONIOENCODING"] = "utf-8"
+            env["PYTHONUTF8"] = "1"
+            env["PYTHONUNBUFFERED"] = "1"  # make child unbuffered
+
+            # -u forces unbuffered stdio in the child
+            cmd = [sys.executable, "-u", "-X", "utf8", script]
             self.proc = subprocess.Popen(
                 cmd,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
-                bufsize=1,
-                universal_newlines=True,
+                bufsize=0,                 # unbuffered pipe at OS level
+                universal_newlines=True,   # text mode
                 encoding="utf-8",
                 errors="replace",
-                env=env
+                env=env,
             )
 
-            # Enable/disable controls
+            # enable controls
             self.start_btn.disabled = True
             self.stop_btn.disabled = False
             self.cmd_input.disabled = False
             self.send_btn.disabled = False
+            self._set_status("running", SUCCESS)
 
-            # Start reader thread
+            # spawn reader (char-by-char for real-time output)
             self.reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
             self.reader_thread.start()
 
-            self._append_text(f"[started] {' '.join(cmd)}\n")
+            self._append(f"[started] {' '.join(cmd)}\n")
 
         except Exception as e:
-            self._append_text(f"[error] Failed to start: {e}\n")
+            self._append(f"[error] failed to start: {e}\n")
             self.proc = None
+            self._set_status("stopped", get_color_from_hex("#2a2e44"))
 
-    def stop_process(self, *_):
+    def _stop(self, *_):
         if not self.proc:
             return
+        self._append("[info] stopping...\n")
         try:
-            self._append_text("[info] Stopping process...\n")
             self._stop_reader.set()
             if self.proc.stdin:
                 try:
-                    # Graceful: send exit/quit just in case the CLI honors it
                     self.proc.stdin.write("exit\n")
                     self.proc.stdin.flush()
                 except Exception:
@@ -176,69 +292,105 @@ class TerminalRunner(BoxLayout):
             except Exception:
                 self.proc.kill()
         finally:
-            self.proc = None
-            self.start_btn.disabled = False
-            self.stop_btn.disabled = True
-            self.cmd_input.disabled = True
-            self.send_btn.disabled = True
+            self._on_process_exit()
 
-    def send_command(self, *_):
+    def _on_process_exit(self):
+        self.proc = None
+        self.start_btn.disabled = False
+        self.stop_btn.disabled = True
+        self.cmd_input.disabled = True
+        self.send_btn.disabled = True
+        self._stop_loading()
+        self._set_status("stopped", get_color_from_hex("#2a2e44"))
+
+    def _reader_loop(self):
+        """Character-by-character reader for immediate UI updates."""
+        try:
+            stdout = self.proc.stdout
+            while True:
+                ch = stdout.read(1)  # blocks until a char or EOF
+                if not ch:
+                    break
+                self.output_queue.put(ch)
+        except Exception as e:
+            self.output_queue.put(f"[reader] {e}\n")
+        finally:
+            self.output_queue.put("[process exited]\n")
+            Clock.schedule_once(lambda *_: self._on_process_exit())
+
+    # ---- I/O
+    def _send(self):
         if not (self.proc and self.proc.stdin):
-            self._append_text("[warn] Process is not running.\n")
+            self._append("[warn] process is not running\n")
             return
         text = self.cmd_input.text
         if not text.strip():
             return
         try:
-            self.proc.stdin.write(text + ("\n" if not text.endswith("\n") else ""))
+            if not text.endswith("\n"):
+                text += "\n"
+            # show loading and lock input BEFORE writing to stdin
+            self._start_loading()
+            self.proc.stdin.write(text)
             self.proc.stdin.flush()
-            self._append_text(f"You> {text}\n")
+            self._append(f"{text}")
             self.cmd_input.text = ""
         except Exception as e:
-            self._append_text(f"[error] Failed to send: {e}\n")
-
-    # ---------- I/O plumbing ----------
-    def _reader_loop(self):
-        try:
-            for line in self.proc.stdout:
-                if self._stop_reader.is_set():
-                    break
-                self.output_queue.put(line)
-        except Exception as e:
-            self.output_queue.put(f"[reader] {e}\n")
-        finally:
-            self.output_queue.put("\n[process exited]\n")
-            # Reset buttons from the main thread
-            Clock.schedule_once(lambda *_: self._on_process_exit())
-
-    def _on_process_exit(self):
-        self.start_btn.disabled = False
-        self.stop_btn.disabled = True
-        self.cmd_input.disabled = True
-        self.send_btn.disabled = True
+            self._append(f"[error] failed to send: {e}\n")
+            self._stop_loading()
 
     def _drain_output_queue(self, *_):
-        appended = False
+        buf = []
         while True:
             try:
-                line = self.output_queue.get_nowait()
+                buf.append(self.output_queue.get_nowait())
             except queue.Empty:
                 break
-            self._append_text(line)
-            appended = True
-        if appended:
-            # Auto-scroll to the end
-            self.terminal.cursor = (len(self.terminal.text), 0)
 
-    def _append_text(self, s: str):
+        if buf:
+            chunk = "".join(buf)
+            self._append(chunk)
+            # Update the last full line if a newline appeared in this chunk
+            if "\n" in chunk:
+                self.last_output_line = self.terminal.text.rstrip("\n").split("\n")[-1]
+            else:
+                # without newline, recompute from the whole buffer
+                self.last_output_line = self.terminal.text.split("\n")[-1]
+
+            if self.waiting_response:
+                self._stop_loading()
+
+            # proper autoscroll: move cursor to the *end line*, not row 0
+            self._scroll_to_end()
+
+    # ---- helpers
+    def _append(self, s: str):
         self.terminal.text += s
 
-class KivyStarterApp(App):
-    title = "PPT Agent Starter (Kivy UI)"
+    def _scroll_to_end(self):
+        lines = self.terminal.text.split("\n")
+        row = max(0, len(lines) - 1)
+        col = len(lines[-1]) if lines else 0
+        # place cursor at (col, row) so TextInput scrolls to the last line
+        self.terminal.cursor = (col, row)
 
+    def _set_status(self, text, color):
+        self.status_pill.text = text
+        self.status_pill._bg_color = color
+        self.status_pill._redraw()
+
+    def _on_key_down(self, _window, key, scancode, codepoint, modifiers):
+        # Ctrl+L -> clear output (optional convenience)
+        if key == 108 and "ctrl" in modifiers:
+            self.terminal.text = ""
+            self._scroll_to_end()
+            return True
+        return False
+
+class AgentConsoleApp(App):
+    title = APP_TITLE
     def build(self):
-        Window.size = (1100, 700)
-        return TerminalRunner()
+        return ConsoleUI()
 
 if __name__ == "__main__":
-    KivyStarterApp().run()
+    AgentConsoleApp().run()

@@ -1448,9 +1448,9 @@ def tool_node(state: AgentState) -> AgentState:
             msg = str(e)
             base = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
             if "10061" in msg or "ConnectError" in msg or "actively refused" in msg:
-                state = add_message(state, "assistant", f"❌ Can't reach your Ollama server at {base}. Start it with `ollama serve` and try again.")
+                state = add_message(state, "assistant", f" Can't reach your Ollama server at {base}. Start it with `ollama serve` and try again.")
             else:
-                state = add_message(state, "assistant", f"❌ Tool `{action}` failed: {e}")
+                state = add_message(state, "assistant", f" Tool `{action}` failed: {e}")
             state["next_action"] = "finish"; state["next_args"] = {}; return state
     else:
         result = None
@@ -1459,7 +1459,7 @@ def tool_node(state: AgentState) -> AgentState:
     if action == "read_pdf":
         text = result or ""
         state["pdf_text"] = text
-        state = add_message(state, "assistant", f"Read PDF ✔ (text cached, {len(text)} chars). You can now say `summary only` or `build slides`.")
+        state = add_message(state, "assistant", f"Read PDF  (text cached, {len(text)} chars). You can now say `summary only` or `build slides`.")
 
     elif action == "summarize_text":
         summary = (result or "").strip()
@@ -1470,7 +1470,7 @@ def tool_node(state: AgentState) -> AgentState:
             try:
                 outline = TOOLS["slide_outline_json"].invoke({"notes": summary, "slide_target": 11})
             except Exception as e:
-                state = add_message(state, "assistant", f"Summary ready ✔\n\n{summary}\n\n(Outline failed during auto-chain: {e})")
+                state = add_message(state, "assistant", f"Summary ready \n\n{summary}\n\n(Outline failed during auto-chain: {e})")
                 state["next_action"] = "finish"; state["next_args"] = {}; return state
 
             state["outline"] = outline
@@ -1490,15 +1490,15 @@ def tool_node(state: AgentState) -> AgentState:
                 state["last_outline"] = outline
                 if not KEEP_OUTLINE_AFTER_BUILD:
                     state["outline"] = None
-                state = add_message(state, "assistant", f"Summary ready ✔\n\n{summary}\n\nPPT built ✔ -> {out_file}")
+                state = add_message(state, "assistant", f"Summary ready \n\n{summary}\n\nPPT built  -> {out_file}")
             except Exception as e:
                 pretty = json.dumps(outline, indent=2, ensure_ascii=False)
                 state = add_message(state, "assistant",
-                                    "Summary ready ✔\n\n" + summary +
+                                    "Summary ready \n\n" + summary +
                                     "\n\nSlide outline JSON prepared — review below:\n\n```json\n" + pretty + "\n```\n"
                                     f"(Auto-build failed: {e})\nSay **'build slides'** to render.")
         else:
-            state = add_message(state, "assistant", "Summary ready ✔\n\n" + summary)
+            state = add_message(state, "assistant", "Summary ready \n\n" + summary)
 
     elif action == "slide_outline_json":
         outline = result or {}
@@ -1523,15 +1523,15 @@ def tool_node(state: AgentState) -> AgentState:
                 state["last_outline"] = outline
                 if not KEEP_OUTLINE_AFTER_BUILD:
                     state["outline"] = None
-                state = add_message(state, "assistant", f"Slide outline JSON prepared ✔{saved_note}\n\nPPT built ✔ -> {out_file}")
+                state = add_message(state, "assistant", f"Slide outline JSON prepared {saved_note}\n\nPPT built  -> {out_file}")
             except Exception as e:
                 state = add_message(state, "assistant",
-                                    "Slide outline JSON prepared ✔" + saved_note +
+                                    "Slide outline JSON prepared " + saved_note +
                                     " — review below:\n\n```json\n" + pretty + "\n```\n"
                                     f"(Auto-build failed: {e})\nSay **'build slides'** to render.")
         else:
             state = add_message(state, "assistant",
-                "Slide outline JSON prepared ✔" + saved_note +
+                "Slide outline JSON prepared " + saved_note +
                 " — review below:\n\n```json\n" + pretty + "\n```\n"
                 "Say **'build slides'** to render this outline, or **'regenerate outline'** to try again."
             )
@@ -1542,7 +1542,7 @@ def tool_node(state: AgentState) -> AgentState:
         state["last_outline"] = state.get("outline")
         if not KEEP_OUTLINE_AFTER_BUILD:
             state["outline"] = None
-        state = add_message(state, "assistant", f"PPT built ✔ -> {out_path}")
+        state = add_message(state, "assistant", f"PPT built -> {out_path}")
 
     elif action == "chat":
         state = add_message(state, "assistant",
@@ -1622,12 +1622,12 @@ def build_app():
 
 if __name__ == "__main__":
     model = os.environ.get("OLLAMA_MODEL", "gpt-oss:20b")
-    print(f"🧠 Using Ollama model: {model}")
+    print(f"Using Ollama model: {model}")
     app = build_app()
 
     state: AgentState = {"messages": []}
 
-    print("\n📽️ LangGraph PPT Agent ready. Type your request (or 'exit').")
+    print("\nLangGraph PPT Agent ready. Type your request (or 'exit').")
     print("Examples:\n - summary only for D:/papers/attention.pdf\n - make slides about diffusion models (10 slides)\n - read D:/papers/paper.pdf pages 1-3 and summarize\n - build slides now\n")
 
     steps = 0
