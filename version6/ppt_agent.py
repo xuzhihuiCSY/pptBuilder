@@ -1,10 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-ppt_agent_langgraph_ollama_v8.py — LangGraph ReAct agent using Ollama
-- Fix: add explicit docstrings to all @tool functions to satisfy LangChain's StructuredTool requirements.
-- Keeps v7 improvements: stronger guidance, fallback build, verbose tracing, recursion guard, debounce.
-"""
 from __future__ import annotations
 
 import argparse
@@ -15,14 +8,15 @@ import sys
 import time
 import hashlib
 from dataclasses import dataclass, asdict
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional,Union
 
+# LangChain / LangGraph
 from langchain_ollama import ChatOllama
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, ToolMessage
 from langchain_core.tools import tool
 from langgraph.prebuilt import create_react_agent
 
-# Optional deps used by tools
+# ---------------- Optional deps used by tools ----------------
 def _safe_imports():
     errors = []
     try:
@@ -39,6 +33,7 @@ def _safe_imports():
 
 DEPS = _safe_imports()
 
+# ---------------- Defaults & persistence ----------------
 DEFAULTS = {
     "MODEL": os.getenv("OLLAMA_MODEL", "gpt-oss:20b"),
     "STATE_PATH": os.path.abspath("./agent_state.json"),
@@ -62,12 +57,13 @@ Notes:
 - DEFAULT_SLIDES = {ds} (you may override if user specifies a different number).
 """.format(ds=DEFAULTS["DEFAULT_SLIDES"])
 
-# ---------------- Persistence ----------------
 @dataclass
 class AgentStatePersisted:
     topic: Optional[str] = None
-    last_outline: Optional[str] = None  # JSON string
+    last_outline: Optional[str] = None   # JSON string
     ppt_path: Optional[str] = None
+    last_text: Optional[str] = None      # NEW: raw text from read_pdf
+    last_summary: Optional[str] = None   # NEW: summary from summarize_text
 
     @classmethod
     def load(cls, path: str) -> "AgentStatePersisted":
@@ -81,14 +77,11 @@ class AgentStatePersisted:
         with open(path, "w", encoding="utf-8") as f:
             json.dump(asdict(self), f, ensure_ascii=False, indent=2)
 
-
 def _load_state() -> AgentStatePersisted:
     return AgentStatePersisted.load(DEFAULTS["STATE_PATH"])
 
-
 def _save_state(s: AgentStatePersisted) -> None:
     s.save(DEFAULTS["STATE_PATH"])
-
 
 # ---------------- Debounce helpers ----------------
 _RECENT: Dict[str, float] = {}
@@ -100,21 +93,17 @@ def _recent_once(key: str, ttl: int = 90) -> bool:
     now = time.time()
     last = _RECENT.get(key)
     _RECENT[key] = now
-    # cleanup
-    for k,v in list(_RECENT.items()):
+    # cleanup old
+    for k, v in list(_RECENT.items()):
         if now - v > ttl:
             _RECENT.pop(k, None)
-    return last is not None and now - last < ttl
-
+    return (last is not None) and (now - last < ttl)
 
 # ---------------- Tools ----------------
 @tool
 def read_pdf(path: str) -> dict:
-    """Read a PDF or plaintext (.txt/.md) file from disk and return the raw text.
-    Args:
-        path: Absolute or relative path to a .pdf, .txt, or .md file.
-    Returns:
-        dict with keys: status, path, text or error.
+    """Read a PDF or plaintext (.txt/.md) file and return the raw text.
+    Persists last_text and clears last_summary.
     """
     PdfReader = DEPS["PdfReader"]
     if not os.path.exists(path):
@@ -124,8 +113,7 @@ def read_pdf(path: str) -> dict:
         if ext in (".txt", ".md"):
             with open(path, "r", encoding="utf-8", errors="ignore") as f:
                 text = f.read()
-            return {"status": "ok", "path": path, "text": text[:2_000_000]}
-        if ext == ".pdf":
+        elif ext == ".pdf":
             if PdfReader is None:
                 return {"status": "error", "error": "pypdf not installed. pip install pypdf"}
             reader = PdfReader(path)
@@ -136,25 +124,27 @@ def read_pdf(path: str) -> dict:
                 except Exception:
                     pass
             text = "\n".join(chunks)
-            return {"status": "ok", "path": path, "text": text[:2_000_000]}
-        return {"status": "error", "error": f"Unsupported file type: {ext}"}
+        else:
+            return {"status": "error", "error": f"Unsupported file type: {ext}"}
+
+        st = _load_state()
+        st.last_text = text[:2_000_000]
+        st.last_summary = None  # new text invalidates any previous summary
+        _save_state(st)
+
+        return {"status": "ok", "path": path, "text": st.last_text}
     except Exception as e:
         return {"status": "error", "error": f"{type(e).__name__}: {e}"}
-
 
 @tool
 def summarize_text(text: str, max_words: int = 400) -> dict:
     """Create a short extractive summary from long text (no LLM cost).
-    Args:
-        text: Raw text to summarize.
-        max_words: Approximate maximum words to keep across extracted sentences.
-    Returns:
-        dict with keys: status, summary.
+    Persists last_summary.
     """
     import textwrap
     words_left = max_words
     out: List[str] = []
-    for para in re.split(r"\n{2,}", text):
+    for para in re.split(r"\n{2,}", text or ""):
         para = para.strip()
         if not para:
             continue
@@ -171,12 +161,12 @@ def summarize_text(text: str, max_words: int = 400) -> dict:
         if words_left <= 0:
             break
     summary = "\n".join(textwrap.wrap(" ".join(out), width=100))
-    st = _load_state()
-    if summary:
-        st.last_outline = None  # invalidate outline since notes changed
-        _save_state(st)
-    return {"status": "ok", "summary": summary}
 
+    st = _load_state()
+    st.last_summary = summary
+    _save_state(st)
+
+    return {"status": "ok", "summary": summary}
 
 def _ollama_json_outline(topic: Optional[str], notes: Optional[str], slide_target: int, model: str) -> str:
     """Internal helper: call ChatOllama to produce a strict-JSON slide outline; returns JSON string."""
@@ -196,7 +186,7 @@ Rules:
     if topic:
         parts.append(f"Topic: {topic}")
     if notes:
-        parts.append(f"Use these notes:\n{notes[:8000]}")
+        parts.append(f"Use these notes:\n{(notes or '')[:8000]}")
     prompt = "\n".join(parts)
     resp = llm.invoke([SystemMessage(content=sys), HumanMessage(content=prompt)])
     content = (resp.content or "").strip()
@@ -210,22 +200,28 @@ Rules:
         }, ensure_ascii=False, indent=2)
     return content
 
-
 _OUTLINE_CACHE: Dict[str, str] = {}
 
 @tool
-def slide_outline_json(topic: Optional[str] = None, notes: Optional[str] = None, slide_target: int = DEFAULTS["DEFAULT_SLIDES"], model: Optional[str] = None) -> dict:
+def slide_outline_json(
+    topic: Optional[str] = None,
+    notes: Optional[str] = None,
+    slide_target: int = DEFAULTS["DEFAULT_SLIDES"],
+    model = DEFAULTS["MODEL"]
+) -> dict:
     """Create a JSON outline for a PPT (deck_title + slides[title, bullets]) using the LLM.
-    Args:
-        topic: Topic for the presentation.
-        notes: Optional notes to incorporate.
-        slide_target: Desired number of slides including the title slide.
-        model: Optional override of the Ollama model name.
-    Returns:
-        dict with keys: status ('ok' or 'cached'), outline_json (str).
+    Accepts optional notes and persists last_outline/topic. Always uses the local Ollama model.
     """
-    model = model or DEFAULTS["MODEL"]
-    key = _sig({"k":"outline","t":topic or "", "n":hashlib.sha1((notes or "").encode()).hexdigest(), "s":slide_target, "m":model})
+    # --- Force local Ollama model; ignore any external 'model' values (e.g., 'gpt-4') ---
+    model = DEFAULTS["MODEL"]
+
+    # --- Debounce key WITHOUT model so retries with different 'model' don't bypass cache ---
+    key = _sig({
+        "k": "outline",
+        "t": topic or "",
+        "n": hashlib.sha1((notes or "").encode()).hexdigest(),
+        "s": slide_target,
+    })
     if _recent_once(key, ttl=90) and key in _OUTLINE_CACHE:
         content = _OUTLINE_CACHE[key]
         st = _load_state()
@@ -239,8 +235,10 @@ def slide_outline_json(topic: Optional[str] = None, notes: Optional[str] = None,
         _save_state(st)
         return {"status": "cached", "outline_json": content}
 
+    # --- Call the LLM to produce the outline (strict JSON) ---
     content = _ollama_json_outline(topic, notes, slide_target, model)
     _OUTLINE_CACHE[key] = content
+
     st = _load_state()
     st.last_outline = content
     if topic:
@@ -250,32 +248,55 @@ def slide_outline_json(topic: Optional[str] = None, notes: Optional[str] = None,
         except Exception:
             st.topic = topic
     _save_state(st)
+
     return {"status": "ok", "outline_json": content}
 
 
 @tool
-def build_ppt(outline_json: str, output_dir: Optional[str] = None) -> dict:
-    """Render a PPTX file from a slide outline JSON string.
+def build_ppt(outline_json: Union[str, dict], output_dir: Optional[str] = None) -> dict:
+    """Render a PPTX file from a slide outline (string JSON or dict).
+
     Args:
-        outline_json: Strict JSON string with 'deck_title' and 'slides' entries.
-        output_dir: Optional directory to write the PPTX file into.
+        outline_json: The slide outline, either a JSON string or a parsed dict.
+                      It must contain:
+                        {
+                          "deck_title": str,
+                          "slides": [{"title": str, "bullets": [str, ...]}, ...]
+                        }
+        output_dir:   Optional directory to write the PPTX into. Defaults to DEFAULTS["OUTPUT_DIR"].
+
     Returns:
-        dict with keys: status, path (absolute), or error.
+        dict with:
+          - status: "ok" | "error" | "skipped"
+          - path:   absolute PPTX filepath when status == "ok" (or when skipped due to debounce)
+          - error:  error message when status == "error"
+          - reason: reason when status == "skipped"
     """
     Presentation = DEPS["Presentation"]
     if Presentation is None:
         return {"status": "error", "error": "python-pptx not installed. pip install python-pptx"}
 
-    sig = _sig({"k":"build","outline": outline_json})
-    now = time.time()
+    # Accept both str and dict, normalize to string for hashing + parse to dict later.
+    try:
+        if isinstance(outline_json, dict):
+            oj_str = json.dumps(outline_json, ensure_ascii=False)
+        else:
+            oj_str = str(outline_json)
+    except Exception as e:
+        return {"status": "error", "error": f"Could not serialize outline_json: {type(e).__name__}: {e}"}
+
+    # Debounce on the normalized string to avoid duplicate builds
+    sig = _sig({"k": "build", "outline": oj_str})
     if _recent_once(sig, ttl=120):
         st = _load_state()
         return {"status": "skipped", "reason": "recently_built", "path": st.ppt_path}
 
+    # Parse into a dict the renderer can use
     try:
-        data = json.loads(outline_json)
+        data = json.loads(oj_str)
     except Exception:
-        data = {"deck_title": "Presentation", "slides": [{"title": "Overview", "bullets": ["(Invalid JSON)"]}]}
+        data = {"deck_title": "Presentation",
+                "slides": [{"title": "Overview", "bullets": ["(Invalid JSON)"]}]}
 
     os.makedirs(output_dir or DEFAULTS["OUTPUT_DIR"], exist_ok=True)
     safe_title = re.sub(r"[^a-zA-Z0-9._-]+", "_", (data.get("deck_title") or "Presentation"))[:80] or "Presentation"
@@ -294,6 +315,7 @@ def build_ppt(outline_json: str, output_dir: Optional[str] = None) -> dict:
         title = shapes.title if hasattr(shapes, "title") else None
         if title:
             title.text = s.get("title") or f"Slide {idx+1}"
+        # find a body placeholder for bullets
         body = None
         for shp in shapes:
             if shp.is_placeholder and getattr(shp, "placeholder_format", None) and shp.placeholder_format.type != 1:
@@ -314,12 +336,17 @@ def build_ppt(outline_json: str, output_dir: Optional[str] = None) -> dict:
     _save_state(st)
     return {"status": "ok", "path": st.ppt_path}
 
-
 @tool
 def describe_latest_deck() -> dict:
     """Describe the most recently built deck without rebuilding it.
+
     Returns:
-        dict with keys: status ('ok' or 'no_deck'), path, topic, headings (list of slide titles).
+        dict: {
+            "status": "ok" | "no_deck",
+            "path": str | None,         # absolute PPTX path if available
+            "topic": str | None,        # last known topic
+            "headings": list[str]       # first ~8 slide titles if outline exists
+        }
     """
     st = _load_state()
     if not st.ppt_path:
@@ -334,13 +361,11 @@ def describe_latest_deck() -> dict:
             pass
     return {"status": "ok", "path": st.ppt_path, "topic": st.topic, "headings": headings}
 
-
 TOOLS = [read_pdf, summarize_text, slide_outline_json, build_ppt, describe_latest_deck]
 
-
+# ---------------- Utility helpers ----------------
 def ensure_dirs():
     os.makedirs(DEFAULTS["OUTPUT_DIR"], exist_ok=True)
-
 
 def _pretty(obj: Any, max_len: int = 240) -> str:
     try:
@@ -349,15 +374,18 @@ def _pretty(obj: Any, max_len: int = 240) -> str:
         s = str(obj)
     return (s[:max_len] + "…") if len(s) > max_len else s
 
+def _user_wants_build(txt: str) -> bool:
+    t = (txt or "").lower()
+    return (
+        ("ppt" in t or "slides" in t or "presentation" in t)
+        and ("build" in t or "make" in t or "create" in t)
+    ) or ("based on this paper" in t or "use that" in t)
 
-def _extract_topic_from_text(text: str) -> Optional[str]:
-    """Heuristic: capture topic after the word 'about'."""
-    m = re.search(r"about\s+(.+)$", text, flags=re.I)
-    if m:
-        return m.group(1).strip(" .!?\"'")
-    return None
+def _topic_from_text(txt: str) -> str:
+    m = re.search(r"(about|on|regarding)\s+(.+)$", txt or "", flags=re.I)
+    return (m.group(2).strip(" .!?\"'") if m else "Presentation")
 
-
+# ---------------- Main / Agent loop ----------------
 def main():
     parser = argparse.ArgumentParser(description="LangGraph ReAct agent (Ollama)")
     parser.add_argument("--model", default=DEFAULTS["MODEL"], help="Ollama model, e.g. gpt-oss:20b")
@@ -384,6 +412,7 @@ def main():
         history += [HumanMessage(content=user_text)]
         final = None
         step = 1
+        # stream with recursion guard
         for event in graph.stream({"messages": history}, stream_mode="values", config={"recursion_limit": args.recursion}):
             final = event
             if not args.verbose:
@@ -420,35 +449,41 @@ def main():
                 print(f"[step {step}] tool → agent: {name} result={_pretty(brief)}")
                 step += 1
 
-        # Fallback: if model didn't issue tool calls but asked to build
+        # After streaming, update history
         if final and "messages" in final and final["messages"]:
             history = final["messages"]
             if not history or not isinstance(history[0], SystemMessage):
                 history = [SystemMessage(content=SYSTEM_PROMPT)] + history
 
-            text_lower = user_text.lower()
-            if ("ppt" in text_lower or "presentation" in text_lower or "slides" in text_lower) and "about" in text_lower:
-                last_ai = next((m for m in reversed(history) if isinstance(m, AIMessage)), None)
-                issued_tool_call = bool(getattr(last_ai, "tool_calls", None))
-                if not issued_tool_call:
-                    topic = _extract_topic_from_text(user_text) or "Presentation"
-                    # Fallback: outline -> build
-                    result_outline = slide_outline_json.invoke({"topic": topic, "slide_target": args.slides})
+            # If the model already produced content, return it
+            last_ai = next((m for m in reversed(history) if isinstance(m, AIMessage)), None)
+            if last_ai and ((getattr(last_ai, "tool_calls", None)) or (last_ai.content or "").strip()):
+                return (last_ai.content or "").strip()
+
+            # Fallback: user clearly wants a build but model didn’t call tools
+            if _user_wants_build(user_text):
+                st = _load_state()
+                notes = st.last_summary or st.last_text
+                topic = _topic_from_text(user_text)
+                if notes:
+                    outline_res = slide_outline_json.invoke({
+                        "topic": topic,
+                        "notes": notes[:8000],
+                        "slide_target": args.slides,
+                    })
                     if args.verbose:
                         print(f"[fallback] agent → tool: slide_outline_json args={_pretty({'topic': topic, 'slide_target': args.slides})}")
-                        print(f"[fallback] tool → agent: slide_outline_json result={_pretty({k:('(json outline)' if k=='outline_json' else v) for k,v in result_outline.items()})}")
-                    result_build = build_ppt.invoke({"outline_json": result_outline.get("outline_json", "{}")})
+                        print(f"[fallback] tool → agent: slide_outline_json result={_pretty({k:('(json outline)' if k=='outline_json' else v) for k,v in outline_res.items()})}")
+                    build_res = build_ppt.invoke({"outline_json": outline_res.get("outline_json", "{}")})
                     if args.verbose:
                         print(f"[fallback] agent → tool: build_ppt args={{'outline_json': '(json outline)'}}")
-                        print(f"[fallback] tool → agent: build_ppt result={_pretty(result_build)}")
-                    path = result_build.get("path")
-                    answer = f"I created your deck about “{topic}”. File: {path}" if path else "I attempted to build the deck but didn’t get a file path."
-                    history += [AIMessage(content=answer)]
-                    return answer
+                        print(f"[fallback] tool → agent: build_ppt result={_pretty(build_res)}")
+                    path = build_res.get("path")
+                    return f"I created your deck about “{topic}”. File: {path}" if path else "I tried to build the deck but didn’t get a file path."
+                else:
+                    return "I can build the PPT. Provide a PDF/text file or a topic (e.g., “build a ppt about cats”)."
 
-            last_ai = next((m for m in reversed(history) if isinstance(m, AIMessage)), None)
-            return (last_ai.content if last_ai else "(no response)") or ""
-
+        # No final content
         return "(no response)"
 
     if args.once:
@@ -457,19 +492,18 @@ def main():
         print(reply)
         return
 
-    print("💡 ppt_agent (LangGraph ReAct + Ollama) — type your request. Ctrl+C to exit.")
+    print("ppt_agent (LangGraph ReAct + Ollama) — type your request. Ctrl+C to exit.")
     print(f"Model: {args.model}")
     while True:
         try:
-            user_text = input("> ").strip()
+            user_text = input("user > ").strip()
             if not user_text:
                 continue
             reply = run_turn(user_text)
-            print(reply)
+            print(f"agent> {reply}")
         except KeyboardInterrupt:
             print("\nBye.")
             break
-
 
 if __name__ == "__main__":
     main()
