@@ -41,6 +41,12 @@ DEFAULTS = {
     "DEFAULT_SLIDES": int(os.getenv("DEFAULT_SLIDES", "11")),
 }
 
+TEMPLATES = {
+    "general": os.path.abspath("./templates/template_general.pptx"),
+    "relax":   os.path.abspath("./templates/template_relax.pptx"),
+    "research":os.path.abspath("./templates/template_research.pptx"),
+}
+
 SYSTEM_PROMPT = """You are a presentation agent that MUST use tools to accomplish tasks.
 Policy:
 - For any request that matches ‘build .*ppt.* about <TOPIC>’ (allow extra words like Hello), you MUST:
@@ -172,16 +178,21 @@ def _ollama_json_outline(topic: Optional[str], notes: Optional[str], slide_targe
     """Internal helper: call ChatOllama to produce a strict-JSON slide outline; returns JSON string."""
     llm = ChatOllama(model=model, temperature=0.2)
     sys = f"""You output STRICT JSON for slide outlines only.
-Schema:
-{{
-  "deck_title": string,
-  "slides": [{{"title": string, "bullets": [string, ...]}}, ...]
-}}
-Rules:
-- Exactly {slide_target} slides (1 title + {slide_target-1} content).
-- Bullets are ≤12 words and non-redundant.
-- Output JSON only. No code fences, no prose outside JSON.
-"""
+        Schema:
+        {{
+        "deck_title": string,
+        "template": "general" | "relax" | "research",
+        "slides": [{{"title": string, "bullets": [string, ...]}}, ...]
+        }}
+        Rules:
+        - Exactly {slide_target} slides (1 title + {slide_target-1} content).
+        - Bullets are ≤12 words and non-redundant.
+        - Always include the "template" field, choosing one of: general, relax, research.
+        • Prefer "research" for academic/technical topics.
+        • Prefer "relax" for lifestyle/wellness/inspiration/culture/soft-skills.
+        • Otherwise use "general".
+        - Output JSON only. No code fences, no prose outside JSON.
+    """
     parts = ["Create a deck outline."]
     if topic:
         parts.append(f"Topic: {topic}")
@@ -303,24 +314,44 @@ def build_ppt(outline_json: Union[str, dict], output_dir: Optional[str] = None) 
     fname = f"{safe_title}_{int(time.time())}.pptx"
     path = os.path.join(output_dir or DEFAULTS["OUTPUT_DIR"], fname)
 
-    prs = Presentation()
+    # NEW: pick template (fallback to blank if missing)
+    tpl_key = str(data.get("template") or "general").lower()
+    tpl_path = TEMPLATES.get(tpl_key)
+    try:
+        prs = Presentation(tpl_path) if (tpl_path and os.path.exists(tpl_path)) else Presentation()
+    except Exception:
+        prs = Presentation()  # hard fallback
+
+    # Layouts (keep existing heuristic)
     title_layout = prs.slide_layouts[0] if len(prs.slide_layouts) > 0 else prs.slide_layouts[1]
     bullet_layout = prs.slide_layouts[1] if len(prs.slide_layouts) > 1 else prs.slide_layouts[0]
 
+    def _first_non_title_text_frame(slide):
+        for shp in slide.shapes:
+            if getattr(shp, "is_placeholder", False) and getattr(getattr(shp, "placeholder_format", None), "type", None) != 1:
+                if hasattr(shp, "text_frame"):
+                    return shp.text_frame
+        return None
+
     slides = data.get("slides") or []
+
+    # NEW: Welcome / topic-only first page
+    welcome = prs.slides.add_slide(title_layout)
+    if getattr(welcome.shapes, "title", None):
+        welcome.shapes.title.text = (data.get("deck_title") or "Welcome")
+    tf = _first_non_title_text_frame(welcome)
+    if tf:
+        tf.clear(); tf.text = "Welcome"
+
+    # Existing content slides
     for idx, s in enumerate(slides):
-        layout = title_layout if idx == 0 else bullet_layout
+        layout = bullet_layout  # content layout
         slide = prs.slides.add_slide(layout)
         shapes = slide.shapes
         title = shapes.title if hasattr(shapes, "title") else None
         if title:
             title.text = s.get("title") or f"Slide {idx+1}"
-        # find a body placeholder for bullets
-        body = None
-        for shp in shapes:
-            if shp.is_placeholder and getattr(shp, "placeholder_format", None) and shp.placeholder_format.type != 1:
-                body = shp.text_frame
-                break
+        body = _first_non_title_text_frame(slide)
         bullets = s.get("bullets") or []
         if body:
             body.clear()
@@ -328,6 +359,11 @@ def build_ppt(outline_json: Union[str, dict], output_dir: Optional[str] = None) 
                 body.text = bullets[0]
                 for b in bullets[1:]:
                     p = body.add_paragraph(); p.text = b; p.level = 0
+
+    # NEW: Closing "Thank You" page
+    thanks = prs.slides.add_slide(title_layout)
+    if getattr(thanks.shapes, "title", None):
+        thanks.shapes.title.text = "Thank You"
 
     from pathlib import Path as _P
     prs.save(path)
